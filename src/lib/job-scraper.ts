@@ -9,7 +9,11 @@ import {
   loadLocalHourlyReports,
   initDatabase, 
   ScrapedJob, 
-  HourlyReport 
+  HourlyReport,
+  getScratchDir,
+  dbLoadJobs,
+  dbClearJobs,
+  isPgAvailable
 } from './db';
 
 export interface JobScrapeState {
@@ -20,7 +24,7 @@ export interface JobScrapeState {
   logs: string[];
 }
 
-const JOBS_FILE = path.join('/Users/ravipatichinnaranga/.gemini/antigravity-ide/scratch', 'jobs_data.json');
+const JOBS_FILE = path.join(getScratchDir(), 'jobs_data.json');
 
 const USER_AGENTS = [
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
@@ -1773,7 +1777,8 @@ export async function runJobScraper() {
 
     // Comparison Engine (OPEN vs CLOSED vs UPDATED)
     const previousJobsMap = new Map<string, ScrapedJob>();
-    jobsState.jobs.forEach(j => previousJobsMap.set(j.job_id, j));
+    const previousJobsList = isPgAvailable ? await dbLoadJobs() : jobsState.jobs;
+    previousJobsList.forEach(j => previousJobsMap.set(j.job_id, j));
 
     const discoveredJobIds = new Set<string>();
     let newJobsFound = 0;
@@ -1814,7 +1819,7 @@ export async function runJobScraper() {
 
     // 2. Process closed jobs
     let closedJobsFound = 0;
-    for (const prevJob of jobsState.jobs) {
+    for (const prevJob of previousJobsList) {
       if (!discoveredJobIds.has(prevJob.job_id) && prevJob.status === 'OPEN') {
         const isSeededJob = prevJob.is_seeded || prevJob.isSeeded;
         const isActive = isSeededJob ? true : await validateUrlActive(prevJob.job_url);
@@ -1872,13 +1877,16 @@ export async function runJobScraper() {
   return jobsState;
 }
 
-export function clearScrapedJobs(): JobScrapeState {
+export async function clearScrapedJobs(): Promise<JobScrapeState> {
   const state = loadJobState();
   state.jobs = [];
   state.status = 'idle';
   state.logs = ['🗑️ Jobs Discovery Agent database cleared.'];
   saveJobState(state);
   exportToCSV([]);
+  if (isPgAvailable) {
+    await dbClearJobs().catch(err => console.error(err));
+  }
   return state;
 }
 

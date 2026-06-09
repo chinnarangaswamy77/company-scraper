@@ -6,7 +6,12 @@ import {
   startJobScraperCron,
   saveJobState
 } from '@/lib/job-scraper';
-import { loadLocalHourlyReports } from '@/lib/db';
+import { 
+  loadLocalHourlyReports, 
+  dbLoadJobs, 
+  dbLoadHourlyReports, 
+  isPgAvailable 
+} from '@/lib/db';
 import { toggleCompanyJobTracking } from '@/lib/scraper';
 
 // GET: Retrieves current job scraping state and historical hourly reports
@@ -16,10 +21,19 @@ export async function GET(req: NextRequest) {
     startJobScraperCron();
     
     const state = loadJobState();
-    const reports = loadLocalHourlyReports();
+    let jobs = state.jobs;
+    let reports = [];
+
+    if (isPgAvailable) {
+      jobs = await dbLoadJobs();
+      reports = await dbLoadHourlyReports();
+    } else {
+      reports = loadLocalHourlyReports();
+    }
 
     return NextResponse.json({
       ...state,
+      jobs,
       reports
     });
   } catch (error: any) {
@@ -57,7 +71,7 @@ export async function POST(req: NextRequest) {
         break;
 
       case 'clear':
-        state = clearScrapedJobs();
+        state = await clearScrapedJobs();
         break;
 
       case 'toggle_tracking':
@@ -71,9 +85,19 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ error: `Invalid action: ${action}` }, { status: 400 });
     }
 
-    const reports = loadLocalHourlyReports();
+    let jobs = state.jobs;
+    let reports = [];
+
+    if (isPgAvailable) {
+      jobs = await dbLoadJobs();
+      reports = await dbLoadHourlyReports();
+    } else {
+      reports = loadLocalHourlyReports();
+    }
+
     return NextResponse.json({
       ...state,
+      jobs,
       reports
     });
   } catch (error: any) {

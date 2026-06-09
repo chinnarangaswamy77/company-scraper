@@ -97,8 +97,10 @@ const USER_AGENTS = [
   'Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:123.0) Gecko/20100101 Firefox/123.0'
 ];
 
+import { getScratchDir } from './db';
+
 // Path to save state
-const STATE_FILE = path.join('/Users/ravipatichinnaranga/.gemini/antigravity-ide/scratch', 'scraper_progress.json');
+const STATE_FILE = path.join(getScratchDir(), 'scraper_progress.json');
 
 // Memory cache as fallback
 let inMemoryState: ScrapeState | null = null;

@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import pg from 'pg';
 
 export interface ScrapedJob {
   job_id: string;
@@ -53,18 +54,35 @@ export interface HourlyReport {
   companies_scanned: number;
 }
 
-const SCRATCH_DIR = '/Users/ravipatichinnaranga/.gemini/antigravity-ide/scratch';
+export function getScratchDir(): string {
+  const localDir = '/Users/ravipatichinnaranga/.gemini/antigravity-ide/scratch';
+  try {
+    if (fs.existsSync(localDir)) {
+      fs.accessSync(localDir, fs.constants.W_OK);
+      return localDir;
+    }
+  } catch (e) {}
+
+  const fallbackDir = path.join(process.cwd(), 'scratch');
+  if (!fs.existsSync(fallbackDir)) {
+    try {
+      fs.mkdirSync(fallbackDir, { recursive: true });
+    } catch (e) {}
+  }
+  return fallbackDir;
+}
+
+const SCRATCH_DIR = getScratchDir();
 const JOBS_JSON_FILE = path.join(SCRATCH_DIR, 'jobs_data.json');
 const JOBS_CSV_FILE = path.join(SCRATCH_DIR, 'jobs_data.csv');
 const LOGS_JSON_FILE = path.join(SCRATCH_DIR, 'hourly_reports_log.json');
 const RAW_LOG_FILE = path.join(SCRATCH_DIR, 'raw_scrape_log.json');
 
-let pool: any = null;
-let isPgAvailable = false;
+let pool: pg.Pool | null = null;
+export let isPgAvailable = false;
 
 if (process.env.PG_CONN_STRING) {
   try {
-    const pg = eval('require')('pg');
     pool = new pg.Pool({
       connectionString: process.env.PG_CONN_STRING,
       ssl: process.env.PG_CONN_STRING.includes('localhost') ? false : { rejectUnauthorized: false }
@@ -357,4 +375,89 @@ export function loadLocalHourlyReports(): HourlyReport[] {
     }
   } catch (e) {}
   return [];
+}
+
+/**
+ * Loads all jobs from PostgreSQL if available
+ */
+export async function dbLoadJobs(): Promise<ScrapedJob[]> {
+  if (!isPgAvailable || !pool) return [];
+  try {
+    const res = await pool.query('SELECT * FROM jobs_discovery ORDER BY last_seen_timestamp DESC');
+    return res.rows.map((row: any) => ({
+      job_id: row.job_id,
+      company_name: row.company_name,
+      company_website: row.company_website,
+      career_page_url: row.career_page_url,
+      job_title: row.job_title,
+      job_url: row.job_url,
+      location: row.location,
+      city: row.city,
+      state: row.state,
+      country: row.country,
+      work_mode: row.work_mode,
+      employment_type: row.employment_type,
+      experience_required: row.experience_required,
+      skills: row.skills || [],
+      department: row.department,
+      posted_date: row.posted_date,
+      application_deadline: row.application_deadline,
+      status: row.status as 'OPEN' | 'CLOSED',
+      source_type: row.source_type as 'OFFICIAL' | 'THIRD_PARTY',
+      source_name: row.source_name,
+      first_seen_timestamp: row.first_seen_timestamp,
+      last_seen_timestamp: row.last_seen_timestamp,
+      description: row.description,
+      apply_url: row.apply_url,
+
+      // Compatibility mapping
+      id: row.job_id,
+      title: row.job_title,
+      companyName: row.company_name,
+      url: row.job_url,
+      scrapedAt: row.last_seen_timestamp,
+      postedDate: row.posted_date,
+      remote: row.work_mode === 'remote',
+      salary: '',
+      salary_range: ''
+    }));
+  } catch (err: any) {
+    console.error('❌ Failed to load jobs from PostgreSQL:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Loads the last 200 hourly reports from PostgreSQL if available
+ */
+export async function dbLoadHourlyReports(): Promise<HourlyReport[]> {
+  if (!isPgAvailable || !pool) return [];
+  try {
+    const res = await pool.query('SELECT * FROM hourly_reports ORDER BY scan_time DESC LIMIT 200');
+    return res.rows.map((row: any) => ({
+      scan_time: row.scan_time,
+      new_jobs_found: row.new_jobs_found,
+      updated_jobs_found: row.updated_jobs_found,
+      closed_jobs_found: row.closed_jobs_found,
+      duplicate_jobs_skipped: row.duplicate_jobs_skipped,
+      companies_scanned: row.companies_scanned
+    }));
+  } catch (err: any) {
+    console.error('❌ Failed to load hourly reports from PostgreSQL:', err.message);
+    return [];
+  }
+}
+
+/**
+ * Clears all job discovery data in PostgreSQL if available
+ */
+export async function dbClearJobs(): Promise<void> {
+  if (!isPgAvailable || !pool) return;
+  try {
+    await pool.query('TRUNCATE TABLE jobs_discovery CASCADE');
+    await pool.query('TRUNCATE TABLE hourly_reports CASCADE');
+    console.log('🧹 PostgreSQL jobs_discovery and hourly_reports tables cleared.');
+  } catch (err: any) {
+    console.error('❌ Failed to clear tables in PostgreSQL:', err.message);
+  }
 }
