@@ -2971,6 +2971,44 @@ export default function CombinedDashboard() {
                     const matchScore = (parseInt(job.job_id?.substring(0, 4) || 'a1', 16) % 15) + 84;
                     const isHighGrowth = job.company_name.length % 2 === 0;
 
+                    // Resolve website domain and careers portal URL dynamically
+                    const resolvedWebsite = (() => {
+                      if (job.company_website && job.company_website !== 'N/A') {
+                        return job.company_website;
+                      }
+                      // Lookup in loaded companies database
+                      const found = scrapeState?.companies?.find(
+                        (c: any) => c.name.toLowerCase().replace(/[^a-z0-9]/g, '') === job.company_name.toLowerCase().replace(/[^a-z0-9]/g, '')
+                      );
+                      if (found && found.website && found.website !== 'N/A') {
+                        return found.website;
+                      }
+                      // Heuristic guess fallback
+                      const cleanName = job.company_name
+                        .toLowerCase()
+                        .trim()
+                        .replace(/[^a-z0-9]/g, '')
+                        .replace(/(tech|technology|consulting|services|solutions|india|software|systems|labs|analytics|group|corp|corporation|inc|ltd|limited|pvt|private)$/g, '');
+                      if (cleanName && cleanName.length > 1) {
+                        return `https://${cleanName}.com`;
+                      }
+                      return null;
+                    })();
+
+                    const resolvedCareers = (() => {
+                      if (job.career_page_url && job.career_page_url !== 'N/A') {
+                        return job.career_page_url;
+                      }
+                      // Lookup in loaded companies database
+                      const found = scrapeState?.companies?.find(
+                        (c: any) => c.name.toLowerCase().replace(/[^a-z0-9]/g, '') === job.company_name.toLowerCase().replace(/[^a-z0-9]/g, '')
+                      );
+                      if (found && found.careers && found.careers !== 'N/A') {
+                        return found.careers;
+                      }
+                      return null;
+                    })();
+
                     return (
                       <div
                         key={job.job_id || `${job.job_url}-${idx}`}
@@ -2993,7 +3031,7 @@ export default function CombinedDashboard() {
                           />
                         </div>
 
-                        <CompanyAvatar name={job.company_name} website={job.company_website} size={34} />
+                        <CompanyAvatar name={job.company_name} website={resolvedWebsite || undefined} size={34} />
 
                         <div className="flex-1 min-w-0 flex flex-col md:flex-row md:items-center justify-between gap-3">
                           <div className="min-w-0">
@@ -3015,11 +3053,11 @@ export default function CombinedDashboard() {
                             </div>
                             <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-550 font-bold flex-wrap">
                               <span className="text-slate-800 font-extrabold">{job.company_name}</span>
-                              {job.company_website && job.company_website !== 'N/A' && (
+                              {resolvedWebsite && (
                                 <>
                                   <span className="text-slate-300">•</span>
                                   <a 
-                                    href={job.company_website}
+                                    href={resolvedWebsite}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     onClick={e => e.stopPropagation()}
@@ -3030,11 +3068,11 @@ export default function CombinedDashboard() {
                                   </a>
                                 </>
                               )}
-                              {job.career_page_url && job.career_page_url !== 'N/A' && (
+                              {resolvedCareers && (
                                 <>
                                   <span className="text-slate-300">•</span>
                                   <a 
-                                    href={job.career_page_url}
+                                    href={resolvedCareers}
                                     target="_blank"
                                     rel="noopener noreferrer"
                                     onClick={e => e.stopPropagation()}
