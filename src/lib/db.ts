@@ -82,15 +82,23 @@ let pool: pg.Pool | null = null;
 export let isPgAvailable = false;
 
 if (process.env.PG_CONN_STRING) {
-  try {
-    pool = new pg.Pool({
-      connectionString: process.env.PG_CONN_STRING,
-      ssl: process.env.PG_CONN_STRING.includes('localhost') ? false : { rejectUnauthorized: false }
-    });
-    isPgAvailable = true;
-    console.log('🔌 PostgreSQL Client detected and initialized.');
-  } catch (err: any) {
-    console.warn('⚠️ Postgres connection string provided, but "pg" library could not be loaded. Falling back to files:', err.message);
+  const isRailwayInternal = process.env.PG_CONN_STRING.includes('railway.internal');
+  const isOnRailway = !!(process.env.RAILWAY_ENVIRONMENT || process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_CONTAINER_URL);
+
+  if (isRailwayInternal && !isOnRailway) {
+    console.log('🔌 Local machine detected with Railway internal DB URL. Gracefully falling back to local file storage.');
+    isPgAvailable = false;
+  } else {
+    try {
+      pool = new pg.Pool({
+        connectionString: process.env.PG_CONN_STRING,
+        ssl: process.env.PG_CONN_STRING.includes('localhost') ? false : { rejectUnauthorized: false }
+      });
+      isPgAvailable = true;
+      console.log('🔌 PostgreSQL Client detected and initialized.');
+    } catch (err: any) {
+      console.warn('⚠️ Postgres connection string provided, but "pg" library could not be loaded. Falling back to files:', err.message);
+    }
   }
 }
 
