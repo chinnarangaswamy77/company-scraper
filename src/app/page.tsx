@@ -198,14 +198,51 @@ const WORK_MODE_TEXT: Record<string, string> = {
   onsite: '#0284c7',
 };
 
-// Initials avatar generator
-function CompanyAvatar({ name, size = 36 }: { name: string; size?: number }) {
-  const initials = name
-    .split(/\s+/)
-    .slice(0, 2)
-    .map(w => w[0]?.toUpperCase() || '')
-    .join('');
-  const hue = name.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+// Initials avatar & logo generator
+function CompanyAvatar({ name, website, size = 36 }: { name: string; website?: string; size?: number }) {
+  const [imgError, setImgError] = useState(false);
+
+  // Reset image error state if website changes
+  useEffect(() => {
+    setImgError(false);
+  }, [website]);
+
+  const domain = useMemo(() => {
+    if (!website || website === 'N/A') return null;
+    try {
+      const cleanUrl = website.trim().replace(/^(https?:\/\/)?(www\.)?/, '').split('/')[0];
+      if (cleanUrl && cleanUrl.includes('.')) {
+        return cleanUrl;
+      }
+    } catch (e) {}
+    return null;
+  }, [website]);
+
+  const initials = useMemo(() => {
+    return name
+      .split(/\s+/)
+      .slice(0, 2)
+      .map(w => w[0]?.toUpperCase() || '')
+      .join('');
+  }, [name]);
+
+  const hue = useMemo(() => {
+    return name.split('').reduce((a, c) => a + c.charCodeAt(0), 0) % 360;
+  }, [name]);
+
+  if (domain && !imgError) {
+    const logoUrl = `https://logo.clearbit.com/${domain}`;
+    return (
+      <img
+        src={logoUrl}
+        alt={name}
+        onError={() => setImgError(true)}
+        className="rounded-lg object-contain bg-white border border-slate-200/60 p-0.5"
+        style={{ width: size, height: size, flexShrink: 0 }}
+      />
+    );
+  }
+
   return (
     <div style={{
       width: size, height: size, borderRadius: 8,
@@ -1506,7 +1543,7 @@ export default function CombinedDashboard() {
           <div className="fixed inset-y-0 right-0 w-full max-w-md bg-white border-l border-slate-200 shadow-2xl z-[90] flex flex-col animate-in slide-in-from-right duration-350">
             <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
               <div className="flex items-center gap-3">
-                <CompanyAvatar name={selectedCompanyForDrawer.name} size={36} />
+                <CompanyAvatar name={selectedCompanyForDrawer.name} website={selectedCompanyForDrawer.website} size={36} />
                 <div>
                   <h3 className="text-sm font-bold text-slate-800 line-clamp-1">{selectedCompanyForDrawer.name}</h3>
                   <span className="text-[10px] text-slate-400 font-semibold tracking-wide uppercase">Company Profile</span>
@@ -1663,7 +1700,7 @@ export default function CombinedDashboard() {
           <div className="fixed inset-y-0 right-0 w-full max-w-xl bg-white border-l border-slate-200 shadow-2xl z-[90] flex flex-col animate-in slide-in-from-right duration-350">
             <div className="px-6 py-5 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
               <div className="flex items-center gap-3">
-                <CompanyAvatar name={selectedJobForDrawer.company_name} size={36} />
+                <CompanyAvatar name={selectedJobForDrawer.company_name} website={selectedJobForDrawer.company_website} size={36} />
                 <div>
                   <div className="flex items-center gap-2">
                     <h3 className="text-sm font-bold text-slate-800 line-clamp-1">{selectedJobForDrawer.job_title}</h3>
@@ -1817,9 +1854,9 @@ export default function CombinedDashboard() {
                     </div>
 
                     <div className="border-t border-slate-100 pt-3 flex gap-2">
-                      {matchedCompanyForDrawer?.website && matchedCompanyForDrawer.website !== 'N/A' && (
+                      {(matchedCompanyForDrawer?.website || selectedJobForDrawer.company_website) && (
                         <a
-                          href={matchedCompanyForDrawer.website}
+                          href={matchedCompanyForDrawer?.website || selectedJobForDrawer.company_website}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex-1 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg text-[10.5px] font-bold text-slate-700 shadow-3xs flex items-center justify-center gap-1"
@@ -1828,9 +1865,9 @@ export default function CombinedDashboard() {
                           <ExternalLink className="w-3 h-3 text-slate-400" />
                         </a>
                       )}
-                      {matchedCompanyForDrawer?.careers && matchedCompanyForDrawer.careers !== 'N/A' && (
+                      {(matchedCompanyForDrawer?.careers || selectedJobForDrawer.career_page_url) && (
                         <a
-                          href={matchedCompanyForDrawer.careers}
+                          href={matchedCompanyForDrawer?.careers || selectedJobForDrawer.career_page_url}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="flex-1 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 rounded-lg text-[10.5px] font-bold text-slate-700 shadow-3xs flex items-center justify-center gap-1"
@@ -2327,6 +2364,7 @@ export default function CombinedDashboard() {
                           </th>
                           <th className="py-3 px-5">Hiring Employer</th>
                           <th className="py-3 px-5">Website Link</th>
+                          <th className="py-3 px-5">Careers Portal</th>
                           <th className="py-3 px-5">Active Jobs</th>
                           <th className="py-3 px-5 w-28">Status</th>
                           <th className="py-3 px-5 w-16 text-right">Actions</th>
@@ -2368,15 +2406,38 @@ export default function CombinedDashboard() {
                               </td>
                               <td className="py-3.5 px-5">
                                 <div className="flex items-center gap-2.5">
-                                  <CompanyAvatar name={c.name} size={30} />
+                                  <CompanyAvatar name={c.name} website={c.website} size={30} />
                                   <span className="font-bold text-slate-800 truncate max-w-[160px]">{c.name}</span>
                                 </div>
                               </td>
                               <td className="py-3.5 px-5">
                                 {c.website && c.website !== 'N/A' ? (
-                                  <span className="text-slate-500 font-mono text-[11px] truncate max-w-[140px] block">
+                                  <a 
+                                    href={c.website}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="text-indigo-600 hover:text-indigo-850 hover:underline font-mono text-[11px] flex items-center gap-1 max-w-[140px] truncate"
+                                  >
+                                    <ExternalLink className="w-3 h-3 text-indigo-400 shrink-0" />
                                     {c.website.replace(/^https?:\/\/(www\.)?/, '')}
-                                  </span>
+                                  </a>
+                                ) : (
+                                  <span className="text-slate-400 font-normal italic">Pending scan...</span>
+                                )}
+                              </td>
+                              <td className="py-3.5 px-5">
+                                {c.careers && c.careers !== 'N/A' ? (
+                                  <a 
+                                    href={c.careers}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="text-indigo-600 hover:text-indigo-850 hover:underline font-mono text-[11px] flex items-center gap-1 max-w-[140px] truncate"
+                                  >
+                                    <ExternalLink className="w-3 h-3 text-indigo-400 shrink-0" />
+                                    View Portal
+                                  </a>
                                 ) : (
                                   <span className="text-slate-400 font-normal italic">Pending scan...</span>
                                 )}
@@ -2932,7 +2993,7 @@ export default function CombinedDashboard() {
                           />
                         </div>
 
-                        <CompanyAvatar name={job.company_name} size={34} />
+                        <CompanyAvatar name={job.company_name} website={job.company_website} size={34} />
 
                         <div className="flex-1 min-w-0 flex flex-col md:flex-row md:items-center justify-between gap-3">
                           <div className="min-w-0">
@@ -2952,10 +3013,40 @@ export default function CombinedDashboard() {
                                 <span className="text-[8px] font-black px-1.5 py-0.2 bg-indigo-50 text-indigo-700 rounded-sm shrink-0 uppercase tracking-wider">⚡ Hiring Fast</span>
                               )}
                             </div>
-                            <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-500 font-semibold">
-                              <span>{job.company_name}</span>
-                              <span>•</span>
-                              <span className="text-slate-400 font-mono text-[9.5px]">Match score: <strong className="text-indigo-600">{matchScore}%</strong></span>
+                            <div className="flex items-center gap-2 mt-0.5 text-[10px] text-slate-550 font-bold flex-wrap">
+                              <span className="text-slate-800 font-extrabold">{job.company_name}</span>
+                              {job.company_website && job.company_website !== 'N/A' && (
+                                <>
+                                  <span className="text-slate-300">•</span>
+                                  <a 
+                                    href={job.company_website}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="text-indigo-650 hover:text-indigo-850 hover:underline flex items-center gap-0.5 text-[9.5px]"
+                                  >
+                                    <ExternalLink className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
+                                    website
+                                  </a>
+                                </>
+                              )}
+                              {job.career_page_url && job.career_page_url !== 'N/A' && (
+                                <>
+                                  <span className="text-slate-300">•</span>
+                                  <a 
+                                    href={job.career_page_url}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    onClick={e => e.stopPropagation()}
+                                    className="text-indigo-650 hover:text-indigo-850 hover:underline flex items-center gap-0.5 text-[9.5px]"
+                                  >
+                                    <ExternalLink className="w-2.5 h-2.5 text-indigo-400 shrink-0" />
+                                    careers page
+                                  </a>
+                                </>
+                              )}
+                              <span className="text-slate-300">•</span>
+                              <span className="text-slate-405 font-mono text-[9.5px] font-medium">Match score: <strong className="text-indigo-650">{matchScore}%</strong></span>
                             </div>
                           </div>
 
