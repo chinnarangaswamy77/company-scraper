@@ -1222,12 +1222,8 @@ export function generateJobFingerprint(job: {
   const normCompany = normalizeCompanyName(job.company_name).toLowerCase();
   const normTitle = job.job_title.toLowerCase().replace(/\s+/g, '');
   const normLoc = job.location.toLowerCase().replace(/\s+/g, '');
-  
-  let postingId = '';
-  const match = cleanUrl.match(/\/(\d+)\b/);
-  if (match) postingId = match[1];
 
-  const raw = `${normCompany}|${normTitle}|${normLoc}|${postingId}|${cleanUrl}|${job.posted_date || ''}`;
+  const raw = `${normCompany}|${normTitle}|${normLoc}|${cleanUrl}`;
   
   let hash = 5381;
   for (let i = 0; i < raw.length; i++) {

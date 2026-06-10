@@ -10,7 +10,8 @@ import {
   loadLocalHourlyReports, 
   dbLoadJobs, 
   dbLoadHourlyReports, 
-  isPgAvailable 
+  isPgAvailable,
+  initDatabase
 } from '@/lib/db';
 import { toggleCompanyJobTracking } from '@/lib/scraper';
 
@@ -19,6 +20,11 @@ export async function GET(req: NextRequest) {
   try {
     // Start hourly background sync if not already active
     startJobScraperCron();
+    
+    // Initialize & clean database duplicates on dashboard load
+    if (isPgAvailable) {
+      await initDatabase().catch(err => console.error('DB init failed on GET:', err.message));
+    }
     
     const state = loadJobState();
     let jobs = state.jobs;

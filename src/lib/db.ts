@@ -142,6 +142,23 @@ export async function initDatabase() {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+
+      // Run database deduplication query to clean up any duplicates created by the old unstable fingerprint hashing bug
+      const deleteRes = await client.query(`
+        DELETE FROM jobs_discovery a USING jobs_discovery b
+        WHERE a.job_id <> b.job_id
+          AND (a.last_seen_timestamp < b.last_seen_timestamp OR (a.last_seen_timestamp = b.last_seen_timestamp AND a.job_id < b.job_id))
+          AND (
+            (a.company_name = b.company_name 
+             AND LOWER(REPLACE(a.job_title, ' ', '')) = LOWER(REPLACE(b.job_title, ' ', ''))
+             AND LOWER(REPLACE(a.location, ' ', '')) = LOWER(REPLACE(b.location, ' ', '')))
+            OR SPLIT_PART(LOWER(a.job_url), '?', 1) = SPLIT_PART(LOWER(b.job_url), '?', 1)
+          );
+      `);
+      if (deleteRes.rowCount && deleteRes.rowCount > 0) {
+        console.log(`🧹 Database cleanup complete: removed ${deleteRes.rowCount} historical duplicate jobs from PostgreSQL.`);
+      }
+
       console.log('✅ PostgreSQL Job Discovery tables verified/created successfully.');
     } finally {
       client.release();
