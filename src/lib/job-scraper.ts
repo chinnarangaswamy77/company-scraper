@@ -1,14 +1,14 @@
 import fs from 'fs';
 import path from 'path';
-import { 
-  dbUpsertJob, 
-  dbSaveHourlyReport, 
-  exportToCSV, 
+import {
+  dbUpsertJob,
+  dbSaveHourlyReport,
+  exportToCSV,
   saveRawScrapeLog,
-  saveLocalHourlyReport, 
+  saveLocalHourlyReport,
   loadLocalHourlyReports,
-  initDatabase, 
-  ScrapedJob, 
+  initDatabase,
+  ScrapedJob,
   HourlyReport,
   getScratchDir,
   dbLoadJobs,
@@ -41,7 +41,7 @@ export function loadJobState(): JobScrapeState {
     if (fs.existsSync(JOBS_FILE)) {
       const content = fs.readFileSync(JOBS_FILE, 'utf-8');
       inMemoryJobState = JSON.parse(content);
-      
+
       if (inMemoryJobState) {
         if (inMemoryJobState.jobs) {
           // Normalize and filter out duplicates completely
@@ -73,7 +73,7 @@ export function loadJobState(): JobScrapeState {
                 hasDuplicates = true;
                 return false;
               }
-              
+
               seenUrls.add(cleanUrl);
               if (cleanApplyUrl) seenUrls.add(cleanApplyUrl);
               seenFingerprints.add(j.job_id);
@@ -146,12 +146,12 @@ export function startJobScraperCron() {
   }
 
   const state = loadJobState();
-  
+
   const scheduleNextRun = () => {
     state.nextRunTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     saveJobState(state);
   };
-  
+
   if (!state.nextRunTime || globalWithCron.currentIntervalMinutes !== 10) {
     scheduleNextRun();
   }
@@ -164,7 +164,7 @@ export function startJobScraperCron() {
     currentState.lastRunTime = new Date().toISOString();
     currentState.nextRunTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
     saveJobState(currentState);
-    
+
     try {
       await runJobScraper();
     } catch (err: any) {
@@ -221,7 +221,7 @@ export function parseCompanyAndTitle(urlStr: string, titleStr: string): { compan
   try {
     const url = new URL(urlStr);
     const host = url.hostname.toLowerCase();
-    
+
     if (host.includes('lever.co')) {
       const parts = url.pathname.split('/').filter(Boolean);
       if (parts.length > 0) company = parts[0];
@@ -254,7 +254,7 @@ export function parseCompanyAndTitle(urlStr: string, titleStr: string): { compan
         if (subParts.length >= 3) {
           const companyPart = subParts[subParts.length - 2];
           company = companyPart;
-          
+
           const cities = ['bengaluru', 'bangalore', 'hyderabad', 'pune', 'mumbai', 'noida', 'gurgaon', 'gurugram', 'chennai', 'kochi', 'trivandrum', 'delhi', 'india', 'remote', 'wfh'];
           const titleParts = subParts.slice(0, subParts.length - 2).filter(p => !cities.includes(p.toLowerCase()));
           title = titleParts.join(' ');
@@ -270,7 +270,7 @@ export function parseCompanyAndTitle(urlStr: string, titleStr: string): { compan
         }
       }
     }
-  } catch (e) {}
+  } catch (e) { }
 
   const cleanTitle = titleStr
     .replace(/-\s*(Indeed|LinkedIn|Glassdoor|Monster|Foundit|Naukri|Monster India|Monster-India|Wellfound|Instahyre|Cutshort|Hirist).*/i, '')
@@ -340,7 +340,7 @@ export function parseCompanyAndTitle(urlStr: string, titleStr: string): { compan
 
 function extractUrlsFromSearchHtml(html: string): { url: string; title: string; description: string }[] {
   const results: { url: string; title: string; description: string }[] = [];
-  
+
   const ddgRegex = /class="result__a"\s+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
   let match;
 
@@ -353,7 +353,7 @@ function extractUrlsFromSearchHtml(html: string): { url: string; title: string; 
       if (uddgMatch) {
         try {
           url = decodeURIComponent(uddgMatch[1]);
-        } catch (e) {}
+        } catch (e) { }
       }
     }
 
@@ -382,7 +382,7 @@ function extractUrlsFromSearchHtml(html: string): { url: string; title: string; 
       if (ruMatch) {
         try {
           url = decodeURIComponent(ruMatch[1]);
-        } catch (e) {}
+        } catch (e) { }
       }
     }
 
@@ -407,7 +407,7 @@ function extractUrlsFromSearchHtml(html: string): { url: string; title: string; 
 async function queryDDGJobs(query: string): Promise<{ url: string; title: string; description: string }[]> {
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const url = `https://html.duckduckgo.com/html/`;
-  
+
   const response = await fetch(url, {
     method: 'POST',
     headers: {
@@ -732,6 +732,88 @@ async function fetchFreshersworldRSS(role: string): Promise<JobItem[]> {
   } catch { return []; }
 }
 
+async function fetchWWRJobs(): Promise<JobItem[]> {
+  try {
+    const url = 'https://weworkremotely.com/categories/remote-programming-jobs.rss';
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENTS[0], 'Accept': 'application/rss+xml, application/xml' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    return parseRSSItems(xml)
+      .filter(i => i.title && i.link)
+      .map(i => {
+        const parts = i.title.split(':');
+        const company = parts.length > 1 ? parts[0].trim() : '';
+        const title = parts.length > 1 ? parts.slice(1).join(':').trim() : i.title;
+        return {
+          url: i.link,
+          title,
+          description: i.description,
+          location: 'Remote',
+          sourceName: 'WeWorkRemotely',
+          companyName: company
+        };
+      });
+  } catch { return []; }
+}
+
+async function fetchRemoteOKJobs(): Promise<JobItem[]> {
+  try {
+    const url = 'https://remoteok.com/remote-jobs.rss';
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENTS[0], 'Accept': 'application/rss+xml, application/xml' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    return parseRSSItems(xml)
+      .filter(i => i.title && i.link)
+      .map(i => {
+        const parts = i.title.split(':');
+        const company = parts.length > 1 ? parts[0].trim() : '';
+        const title = parts.length > 1 ? parts.slice(1).join(':').trim() : i.title;
+        return {
+          url: i.link,
+          title,
+          description: i.description,
+          location: 'Remote',
+          sourceName: 'RemoteOK',
+          companyName: company
+        };
+      });
+  } catch { return []; }
+}
+
+async function fetchHimalayasJobs(): Promise<JobItem[]> {
+  try {
+    const url = 'https://himalayas.app/jobs.rss';
+    const res = await fetch(url, {
+      headers: { 'User-Agent': USER_AGENTS[0], 'Accept': 'application/rss+xml, application/xml' },
+      signal: AbortSignal.timeout(10000)
+    });
+    if (!res.ok) return [];
+    const xml = await res.text();
+    return parseRSSItems(xml)
+      .filter(i => i.title && i.link)
+      .map(i => {
+        const match = /at\s+([^-|]*)/i.exec(i.title);
+        const company = match ? match[1].trim() : '';
+        const parts = i.title.split(/\s+at\s+/i);
+        const title = parts.length > 0 ? parts[0].trim() : i.title;
+        return {
+          url: i.link,
+          title,
+          description: i.description,
+          location: 'Remote',
+          sourceName: 'Himalayas',
+          companyName: company
+        };
+      });
+  } catch { return []; }
+}
+
 // ─────────────────────────────────────────────────────────────
 //  COMPANY LISTS FOR DIRECT ATS APIS
 // ─────────────────────────────────────────────────────────────
@@ -940,7 +1022,7 @@ const INDIA_CITIES = [
 export function extractSkills(title: string, text: string): string[] {
   const combined = `${title} ${text}`;
   const found: string[] = [];
-  
+
   for (const skill of SKILLS_DICT) {
     let regex: RegExp;
     if (['Go', 'ML', 'AI', 'QA', 'C#', 'C++'].includes(skill)) {
@@ -952,7 +1034,7 @@ export function extractSkills(title: string, text: string): string[] {
       const escaped = skill.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
       regex = new RegExp(`\\b${escaped}\\b`, 'gi');
     }
-    
+
     if (regex.test(combined)) {
       found.push(skill);
     }
@@ -962,12 +1044,12 @@ export function extractSkills(title: string, text: string): string[] {
 
 export function extractExperience(title: string, text: string): string {
   const combined = `${title} ${text}`.toLowerCase();
-  
+
   const rangeMatch = combined.match(/\b(\d+)\s*(?:to|-)\s*(\d+)\s*(?:years?|yrs?)\b/i);
   if (rangeMatch) {
     return `${rangeMatch[1]}-${rangeMatch[2]} years`;
   }
-  
+
   const plusMatch = combined.match(/\b(\d+)\s*\+\s*(?:years?|yrs?)\b/i);
   if (plusMatch) {
     return `${plusMatch[1]}+ years`;
@@ -987,7 +1069,7 @@ export function extractExperience(title: string, text: string): string {
   if (/\b(senior|sr\b|lead|principal|architect|manager)\b/i.test(combined)) {
     return '6+ years';
   }
-  
+
   return '3-5 years';
 }
 
@@ -1038,7 +1120,7 @@ export function extractSalary(title: string, text: string): string {
 
 export function parseCityAndState(title: string, text: string, url: string, location: string): { city: string; state: string } {
   const combined = `${title} ${text} ${url} ${location}`.toLowerCase();
-  
+
   if (combined.includes('bengaluru') || combined.includes('bangalore')) {
     return { city: 'Bengaluru', state: 'Karnataka' };
   }
@@ -1159,11 +1241,11 @@ async function validateUrlActive(url: string): Promise<boolean> {
     if (response.status === 404 || response.status === 410) {
       return false;
     }
-    
+
     if (response.url && (response.url.includes('error=true') || response.url.includes('error='))) {
       return false;
     }
-    
+
     const bodyText = await response.text();
     const lowerBody = bodyText.toLowerCase();
 
@@ -1224,7 +1306,7 @@ export function generateJobFingerprint(job: {
   const normLoc = job.location.toLowerCase().replace(/\s+/g, '');
 
   const raw = `${normCompany}|${normTitle}|${normLoc}|${cleanUrl}`;
-  
+
   let hash = 5381;
   for (let i = 0; i < raw.length; i++) {
     hash = (hash * 33) ^ raw.charCodeAt(i);
@@ -1264,7 +1346,7 @@ function normalizeExistingJobSchema(job: any): ScrapedJob {
     last_seen_timestamp: job.last_seen_timestamp || job.scrapedAt || new Date().toISOString(),
     description: job.description || job.job_description || '',
     apply_url: job.apply_url || job.job_url || job.url || '',
-    
+
     // Compatibility keys
     id: job.id || job.job_id || 'N/A',
     title: job.title || job.job_title || 'Job Opening',
@@ -1315,7 +1397,7 @@ function buildJobFromAtsItem(
       const parts = parsed.pathname.split('/').filter(Boolean);
       careerPageUrl = `https://jobs.ashbyhq.com/${parts[0] || company.toLowerCase()}`;
     }
-  } catch {}
+  } catch { }
 
   return {
     job_id: fingerprint,
@@ -1368,8 +1450,8 @@ const DISCOVERY_QUERIES = [
   `site:glassdoor.co.in "India" (developer OR engineer OR designer OR manager OR analyst OR intern)`,
   `site:foundit.in (developer OR engineer OR designer OR manager OR analyst OR intern) "Bengaluru" OR "Hyderabad" OR "Pune" OR "Mumbai"`,
   // Company careers pages — catch-all
-  `"careers" site:*.io "India" (developer OR engineer OR designer OR manager OR analyst OR intern)`,
-  `"jobs" site:*.com/careers "India" (developer OR engineer OR analyst OR manager OR specialist)`,
+  `"careers" (site:*.io OR site:*.in OR site:*.co OR site:*.co.in OR site:*.net OR site:*.org OR site:*.tech OR site:*.ai) "India" (developer OR engineer OR designer OR manager OR analyst OR intern)`,
+  `"jobs" (site:*.com/careers OR site:*.in/careers OR site:*.co/careers OR site:*.co.in/careers OR site:*.net/careers OR site:*.org/careers OR site:*.tech/careers OR site:*.ai/careers) "India" (developer OR engineer OR analyst OR manager OR specialist)`,
 ];
 
 export async function runJobScraper() {
@@ -1405,9 +1487,9 @@ export async function runJobScraper() {
         if (seenUrls.has(urlKey)) continue;
         seenUrls.add(urlKey);
         const srcName = j.sourceName || defaultSource;
-        const isJobBoard = ['LinkedIn','Naukri','Indeed','Glassdoor','Wellfound',
-          'Instahyre','CutShort','Hirist','Internshala','Foundit','Monster',
-          'Shine','AmbitionBox','TimesJobs','FreshersWorld','Remotive'].includes(srcName);
+        const isJobBoard = ['LinkedIn', 'Naukri', 'Indeed', 'Glassdoor', 'Wellfound',
+          'Instahyre', 'CutShort', 'Hirist', 'Internshala', 'Foundit', 'Monster',
+          'Shine', 'AmbitionBox', 'TimesJobs', 'FreshersWorld', 'Remotive'].includes(srcName);
         (rawDiscoveredJobs as any[]).push(buildJobFromAtsItem(j, srcName, isJobBoard));
         added++;
       }
@@ -1540,6 +1622,42 @@ export async function runJobScraper() {
       await new Promise(r => setTimeout(r, 200));
     }
 
+    // ── Phase 2-G: WeWorkRemotely RSS ──────────────────────────────────────────
+    logJobMessage(jobsState, '📰 Phase 2-G: WeWorkRemotely RSS...');
+    saveJobState(jobsState);
+    try {
+      const wwrJobs = await fetchWWRJobs();
+      const nWwr = ingestItems(wwrJobs, 'WeWorkRemotely');
+      if (nWwr > 0) logJobMessage(jobsState, `  📰 WeWorkRemotely: ${nWwr} jobs`);
+      p2Total += nWwr;
+    } catch (e: any) {
+      logJobMessage(jobsState, `  ⚠️ WeWorkRemotely failed: ${e.message}`);
+    }
+
+    // ── Phase 2-H: RemoteOK RSS ──────────────────────────────────────────────
+    logJobMessage(jobsState, '📰 Phase 2-H: RemoteOK RSS...');
+    saveJobState(jobsState);
+    try {
+      const remoteOkJobs = await fetchRemoteOKJobs();
+      const nRemoteOk = ingestItems(remoteOkJobs, 'RemoteOK');
+      if (nRemoteOk > 0) logJobMessage(jobsState, `  📰 RemoteOK: ${nRemoteOk} jobs`);
+      p2Total += nRemoteOk;
+    } catch (e: any) {
+      logJobMessage(jobsState, `  ⚠️ RemoteOK failed: ${e.message}`);
+    }
+
+    // ── Phase 2-I: Himalayas RSS ─────────────────────────────────────────────
+    logJobMessage(jobsState, '📰 Phase 2-I: Himalayas RSS...');
+    saveJobState(jobsState);
+    try {
+      const himalayasJobs = await fetchHimalayasJobs();
+      const nHimalayas = ingestItems(himalayasJobs, 'Himalayas');
+      if (nHimalayas > 0) logJobMessage(jobsState, `  📰 Himalayas: ${nHimalayas} jobs`);
+      p2Total += nHimalayas;
+    } catch (e: any) {
+      logJobMessage(jobsState, `  ⚠️ Himalayas failed: ${e.message}`);
+    }
+
     logJobMessage(jobsState, `📊 Phase 2 (RSS + Public APIs) complete: ${p2Total} unique jobs found.`);
     logJobMessage(jobsState, `🎯 Total unique jobs from all sources: ${rawDiscoveredJobs.length}`);
     saveJobState(jobsState);
@@ -1548,7 +1666,7 @@ export async function runJobScraper() {
     for (let i = 0; i < DISCOVERY_QUERIES.length; i++) {
       const q = DISCOVERY_QUERIES[i];
       try {
-        logJobMessage(jobsState, `🔄 Search sweep [${i+1}/${DISCOVERY_QUERIES.length}]...`);
+        logJobMessage(jobsState, `🔄 Search sweep [${i + 1}/${DISCOVERY_QUERIES.length}]...`);
         saveJobState(jobsState);
 
         let searchResults: { url: string; title: string; description: string }[] = [];
@@ -1558,7 +1676,7 @@ export async function runJobScraper() {
             queryYahooJobs(q)
           ]);
         } catch {
-          logJobMessage(jobsState, `  ⏭️ Search [${i+1}] timed out — skipping (ATS data still captured).`);
+          logJobMessage(jobsState, `  ⏭️ Search [${i + 1}] timed out — skipping (ATS data still captured).`);
           saveJobState(jobsState);
           await new Promise(r => setTimeout(r, 300));
           continue;
@@ -1567,11 +1685,11 @@ export async function runJobScraper() {
         searchResults.forEach(res => {
           const urlStr = res.url.split('?')[0];
           if (seenUrls.has(urlStr.toLowerCase())) return;
-          
+
           if (!isValidJobPage(res.url, res.title)) {
             return;
           }
-          
+
           seenUrls.add(urlStr.toLowerCase());
 
           const { company, title } = parseCompanyAndTitle(res.url, res.title);
@@ -1635,7 +1753,7 @@ export async function runJobScraper() {
             try {
               const parsed = new URL(res.url);
               companyWebsite = `${parsed.protocol}//${parsed.hostname}`;
-            } catch (e) {}
+            } catch (e) { }
           }
 
           const workMode = extractWorkMode(title, res.description);
@@ -1682,7 +1800,7 @@ export async function runJobScraper() {
             ...partialJob,
             job_id: fingerprint,
             job_fingerprint: fingerprint,
-            
+
             // Compatibility mapping
             id: fingerprint,
             title,
@@ -1700,7 +1818,7 @@ export async function runJobScraper() {
         logJobMessage(jobsState, `⚠️ Crawl sweep error: ${errMsg}`);
         saveJobState(jobsState);
       }
-      
+
       await new Promise(resolve => setTimeout(resolve, 800));
     }
 
@@ -1721,7 +1839,7 @@ export async function runJobScraper() {
     for (const job of rawDiscoveredJobs) {
       const cleanUrl = job.job_url.split('?')[0].toLowerCase();
       const cleanApplyUrl = job.apply_url ? job.apply_url.split('?')[0].toLowerCase() : '';
-      
+
       let isDuplicate = false;
 
       // Duplication checks
@@ -1740,8 +1858,8 @@ export async function runJobScraper() {
 
       // Exclude agency posts if direct company post exists
       if (isStaffingAgency(job.company_name)) {
-        const directExists = rawDiscoveredJobs.some(rj => 
-          rj.job_title.toLowerCase().replace(/\s+/g, '') === normTitle && 
+        const directExists = rawDiscoveredJobs.some(rj =>
+          rj.job_title.toLowerCase().replace(/\s+/g, '') === normTitle &&
           normalizeCompanyName(rj.company_name).toLowerCase() === normCompany &&
           !isStaffingAgency(rj.company_name)
         );
@@ -1759,7 +1877,7 @@ export async function runJobScraper() {
       }
       seenFingerprints.add(job.job_id);
       seenJobGroups.add(groupKey);
-      
+
       uniqueCandidateJobs.push({
         ...job,
         status: 'OPEN',
@@ -1783,7 +1901,7 @@ export async function runJobScraper() {
       const normCompany = normalizeCompanyName(j.company_name).toLowerCase();
       const normLoc = j.location.toLowerCase().replace(/\s+/g, '');
       const groupKey = `${normCompany}|${normTitle}|${normLoc}`;
-      
+
       const existing = previousJobsGroupMap.get(groupKey);
       if (!existing || new Date(j.last_seen_timestamp) > new Date(existing.last_seen_timestamp)) {
         previousJobsGroupMap.set(groupKey, j);
@@ -1811,9 +1929,9 @@ export async function runJobScraper() {
         processedPrevJobIds.add(existingJobByGroup.job_id);
         discoveredJobIds.add(existingJobByGroup.job_id);
 
-        const isFieldUpdated = 
-          existingJobByGroup.location !== job.location || 
-          existingJobByGroup.work_mode !== job.work_mode || 
+        const isFieldUpdated =
+          existingJobByGroup.location !== job.location ||
+          existingJobByGroup.work_mode !== job.work_mode ||
           existingJobByGroup.status !== 'OPEN';
 
         if (isFieldUpdated) {
@@ -1826,7 +1944,7 @@ export async function runJobScraper() {
           job_id: existingJobByGroup.job_id, // Keep the original ID
           job_fingerprint: existingJobByGroup.job_fingerprint || existingJobByGroup.job_id,
           id: existingJobByGroup.id || existingJobByGroup.job_id,
-          
+
           first_seen_timestamp: existingJobByGroup.first_seen_timestamp,
           last_seen_timestamp: new Date().toISOString(),
           status: 'OPEN'
@@ -1852,7 +1970,7 @@ export async function runJobScraper() {
       if (!discoveredJobIds.has(prevJob.job_id) && prevJob.status === 'OPEN') {
         const isSeededJob = prevJob.is_seeded || prevJob.isSeeded;
         const isActive = isSeededJob ? true : await validateUrlActive(prevJob.job_url);
-        
+
         if (!isActive) {
           logJobMessage(jobsState, `🔗 Link validation failed, closing: "${prevJob.job_title}"...`);
           prevJob.status = 'CLOSED';

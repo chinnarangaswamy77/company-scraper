@@ -1144,9 +1144,16 @@ export default function CombinedDashboard() {
   // Jobs filtering matching all filter dropdown parameters
   const allJobs: Job[] = jobsState?.jobs || [];
 
-  const jobSources = useMemo(() =>
-    ['All Sources', ...Array.from(new Set(allJobs.map(j => j.source_name || 'Direct'))).sort()],
-    [allJobs]);
+  const jobSources = useMemo(() => {
+    const defaultSources = [
+      'Greenhouse', 'Lever', 'Remotive', 'Indeed', 'Naukri', 
+      'LinkedIn', 'Ashby', 'SmartRecruiters', 'TimesJobs', 
+      'Shine', 'FreshersWorld', 'WeWorkRemotely', 'RemoteOK', 'Himalayas'
+    ];
+    const dynamicSources = Array.from(new Set(allJobs.map(j => j.source_name || 'Direct'))).filter(Boolean);
+    const combined = Array.from(new Set([...defaultSources, ...dynamicSources])).sort();
+    return ['All Sources', ...combined];
+  }, [allJobs]);
 
   const jobCities = useMemo(() =>
     ['All Cities', ...Array.from(new Set(allJobs.map(j => j.city || '').filter(Boolean))).sort()],
