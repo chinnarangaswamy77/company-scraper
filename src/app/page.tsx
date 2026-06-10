@@ -2897,7 +2897,7 @@ export default function CombinedDashboard() {
                       <div className="flex flex-col">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2.5 block">Discovery Timeline (New Jobs)</span>
                         <div className="h-[150px] w-full relative min-w-0">
-                          <ResponsiveContainer width="100%" height="100%">
+                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
                             <AreaChart data={chartsData.dailyHistory} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                               <defs>
                                 <linearGradient id="colorJobs" x1="0" y1="0" x2="0" y2="1">
@@ -2918,7 +2918,7 @@ export default function CombinedDashboard() {
                       <div className="flex flex-col">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2.5 block">Top Cities Vacancies Split</span>
                         <div className="h-[150px] w-full relative min-w-0">
-                          <ResponsiveContainer width="100%" height="100%">
+                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
                             <BarChart data={chartsData.cities} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                               <XAxis dataKey="name" stroke="#94a3b8" fontSize={10} tickLine={false} />
                               <YAxis stroke="#94a3b8" fontSize={10} tickLine={false} />
