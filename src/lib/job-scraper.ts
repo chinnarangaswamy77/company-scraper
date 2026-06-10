@@ -1776,7 +1776,22 @@ export async function runJobScraper() {
     const previousJobsList = isPgAvailable ? await dbLoadJobs() : jobsState.jobs;
     previousJobsList.forEach(j => previousJobsMap.set(j.job_id, j));
 
+    // Map from normalized group key to existing job to prevent cross-run duplicates from different sources/URLs
+    const previousJobsGroupMap = new Map<string, ScrapedJob>();
+    previousJobsList.forEach(j => {
+      const normTitle = j.job_title.toLowerCase().replace(/\s+/g, '');
+      const normCompany = normalizeCompanyName(j.company_name).toLowerCase();
+      const normLoc = j.location.toLowerCase().replace(/\s+/g, '');
+      const groupKey = `${normCompany}|${normTitle}|${normLoc}`;
+      
+      const existing = previousJobsGroupMap.get(groupKey);
+      if (!existing || new Date(j.last_seen_timestamp) > new Date(existing.last_seen_timestamp)) {
+        previousJobsGroupMap.set(groupKey, j);
+      }
+    });
+
     const discoveredJobIds = new Set<string>();
+    const processedPrevJobIds = new Set<string>();
     let newJobsFound = 0;
     let updatedJobsFound = 0;
 
@@ -1784,38 +1799,56 @@ export async function runJobScraper() {
 
     // 1. Process discovered jobs
     for (const job of uniqueCandidateJobs) {
-      discoveredJobIds.add(job.job_id);
+      const normTitle = job.job_title.toLowerCase().replace(/\s+/g, '');
+      const normCompany = normalizeCompanyName(job.company_name).toLowerCase();
+      const normLoc = job.location.toLowerCase().replace(/\s+/g, '');
+      const groupKey = `${normCompany}|${normTitle}|${normLoc}`;
 
-      const exists = previousJobsMap.get(job.job_id);
-      if (!exists) {
-        nextJobsStateList.push(job);
-        newJobsFound++;
-        dbUpsertJob(job).catch(err => console.error(err));
-      } else {
+      const existingJobByGroup = previousJobsGroupMap.get(groupKey);
+
+      if (existingJobByGroup) {
+        // Match found by company/title/location - update existing instead of creating a duplicate with a new hash/URL
+        processedPrevJobIds.add(existingJobByGroup.job_id);
+        discoveredJobIds.add(existingJobByGroup.job_id);
+
         const isFieldUpdated = 
-          exists.location !== job.location || 
-          exists.work_mode !== job.work_mode || 
-          exists.status !== 'OPEN';
+          existingJobByGroup.location !== job.location || 
+          existingJobByGroup.work_mode !== job.work_mode || 
+          existingJobByGroup.status !== 'OPEN';
 
         if (isFieldUpdated) {
           updatedJobsFound++;
         }
 
         const updatedJob: ScrapedJob = {
-          ...exists,
+          ...existingJobByGroup,
           ...job,
-          first_seen_timestamp: exists.first_seen_timestamp,
+          job_id: existingJobByGroup.job_id, // Keep the original ID
+          job_fingerprint: existingJobByGroup.job_fingerprint || existingJobByGroup.job_id,
+          id: existingJobByGroup.id || existingJobByGroup.job_id,
+          
+          first_seen_timestamp: existingJobByGroup.first_seen_timestamp,
           last_seen_timestamp: new Date().toISOString(),
           status: 'OPEN'
         };
         nextJobsStateList.push(updatedJob);
         dbUpsertJob(updatedJob).catch(err => console.error(err));
+      } else {
+        // Genuinely new job
+        discoveredJobIds.add(job.job_id);
+        nextJobsStateList.push(job);
+        newJobsFound++;
+        dbUpsertJob(job).catch(err => console.error(err));
       }
     }
 
     // 2. Process closed jobs
     let closedJobsFound = 0;
     for (const prevJob of previousJobsList) {
+      if (processedPrevJobIds.has(prevJob.job_id)) {
+        // Already updated and pushed in step 1
+        continue;
+      }
       if (!discoveredJobIds.has(prevJob.job_id) && prevJob.status === 'OPEN') {
         const isSeededJob = prevJob.is_seeded || prevJob.isSeeded;
         const isActive = isSeededJob ? true : await validateUrlActive(prevJob.job_url);

@@ -2574,7 +2574,7 @@ export default function CombinedDashboard() {
                 { title: 'Remote Roles', val: jobsStats.remote, trend: '▲ 12%', color: 'text-emerald-650', key: 'new_jobs_found', label: 'Wfh index count' },
                 { title: 'Internships', val: jobsStats.internships, trend: '▲ 6%', color: 'text-violet-650', key: 'new_jobs_found', label: 'Fresh entry roles' },
                 { title: 'Direct List', val: jobsStats.direct, trend: '▲ 9%', color: 'text-slate-750', key: 'companies_scanned', label: 'Direct career sites' },
-                { title: 'Duplicates', val: jobsStats.duplicatesRemoved, trend: '▼ 18%', color: 'text-slate-450', key: 'duplicate_jobs_skipped', label: 'Bypassed overlaps' },
+                { title: 'Deduplicated', val: jobsStats.duplicatesRemoved, trend: '▼ 18%', color: 'text-emerald-600', key: 'duplicate_jobs_skipped', label: 'Prevented overlaps' },
                 { title: 'Closing Soon', val: Math.round(jobsStats.total * 0.12), trend: '▼ 3%', color: 'text-amber-600', key: 'closed_jobs_found', label: 'Expiring openings' },
                 { title: 'Avg/Minute', val: '0.8', trend: '▲ 5%', color: 'text-emerald-500', key: 'new_jobs_found', label: 'Discovery flow rate' }
               ].map((card, i) => (
@@ -3439,7 +3439,7 @@ export default function CombinedDashboard() {
                       <th className="p-3 text-center">New Jobs</th>
                       <th className="p-3 text-center">Updated</th>
                       <th className="p-3 text-center">Closed</th>
-                      <th className="p-3 text-center">Duplicates</th>
+                      <th className="p-3 text-center">Deduplicated</th>
                       <th className="p-3 text-center">Scanned</th>
                     </tr>
                   </thead>

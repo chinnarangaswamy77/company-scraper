@@ -149,10 +149,25 @@ export async function initDatabase() {
         WHERE a.job_id <> b.job_id
           AND (a.last_seen_timestamp < b.last_seen_timestamp OR (a.last_seen_timestamp = b.last_seen_timestamp AND a.job_id < b.job_id))
           AND (
-            (a.company_name = b.company_name 
-             AND LOWER(REPLACE(a.job_title, ' ', '')) = LOWER(REPLACE(b.job_title, ' ', ''))
-             AND LOWER(REPLACE(a.location, ' ', '')) = LOWER(REPLACE(b.location, ' ', '')))
+            (
+              -- Normalized company name match (strips Pvt, Ltd, Software, etc.)
+              LOWER(REGEXP_REPLACE(REGEXP_REPLACE(a.company_name, $$\\b(pvt\\.?\\s*ltd\\.?|private\\s+limited|ltd\\.?|limited|inc\\.?|corporation|corp\\.?|co\\.?|company|india|development\\s+centre|r\\&d\\s+institute|r\\&d\\s+center|software\\s+centre|global\\s+software|technologies|solutions|software|it\\s+services|systems)\\b$$, '', 'gi'), $$[^a-z0-9]$$, '', 'g'))
+              =
+              LOWER(REGEXP_REPLACE(REGEXP_REPLACE(b.company_name, $$\\b(pvt\\.?\\s*ltd\\.?|private\\s+limited|ltd\\.?|limited|inc\\.?|corporation|corp\\.?|co\\.?|company|india|development\\s+centre|r\\&d\\s+institute|r\\&d\\s+center|software\\s+centre|global\\s+software|technologies|solutions|software|it\\s+services|systems)\\b$$, '', 'gi'), $$[^a-z0-9]$$, '', 'g'))
+              
+              -- Normalized title match (strips parentheticals like (React), [Immediate] and non-alphanumeric)
+              AND LOWER(REGEXP_REPLACE(REGEXP_REPLACE(a.job_title, $$\\s*[\\(\\[][^\\]\\)]*[\\)\\]]$$, '', 'g'), $$[^a-z0-9]$$, '', 'g'))
+              =
+              LOWER(REGEXP_REPLACE(REGEXP_REPLACE(b.job_title, $$\\s*[\\(\\[][^\\]\\)]*[\\)\\]]$$, '', 'g'), $$[^a-z0-9]$$, '', 'g'))
+              
+              -- Normalized location/city match
+              AND COALESCE(NULLIF(LOWER(REGEXP_REPLACE(a.city, $$[^a-z]$$, '', 'g')), ''), NULLIF(LOWER(REGEXP_REPLACE(a.location, $$[^a-z]$$, '', 'g')), ''), 'india')
+              =
+              COALESCE(NULLIF(LOWER(REGEXP_REPLACE(b.city, $$[^a-z]$$, '', 'g')), ''), NULLIF(LOWER(REGEXP_REPLACE(b.location, $$[^a-z]$$, '', 'g')), ''), 'india')
+            )
+            -- OR if URLs match (ignoring query parameters)
             OR SPLIT_PART(LOWER(a.job_url), '?', 1) = SPLIT_PART(LOWER(b.job_url), '?', 1)
+            OR (a.apply_url IS NOT NULL AND b.apply_url IS NOT NULL AND SPLIT_PART(LOWER(a.apply_url), '?', 1) = SPLIT_PART(LOWER(b.apply_url), '?', 1))
           );
       `);
       if (deleteRes.rowCount && deleteRes.rowCount > 0) {
