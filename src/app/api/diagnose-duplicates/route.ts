@@ -37,7 +37,7 @@ export async function GET(_req: NextRequest) {
           LOWER(REGEXP_REPLACE(REGEXP_REPLACE(a.job_title, '\\\\s*[\\\\(\\\\[][^\\\\]\\\\)]*[\\\\]\\\\]', '', 'g'), '[^a-z0-9]', '', 'g')) as norm_title,
           COALESCE(NULLIF(LOWER(REGEXP_REPLACE(a.city, '[^a-z]', '', 'g')), ''), NULLIF(LOWER(REGEXP_REPLACE(a.location, '[^a-z]', '', 'g')), ''), 'india') as norm_location,
           COUNT(*) as cnt,
-          ARRAY_AGG(job_id) as ids,
+          ARRAY_AGG(job_id) asids,
           ARRAY_AGG(company_name) as original_companies,
           ARRAY_AGG(job_title) as original_titles,
           ARRAY_AGG(location) as locations,

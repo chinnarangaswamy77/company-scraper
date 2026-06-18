@@ -112,6 +112,12 @@ interface Job {
   isDuplicate?: boolean;
   is_seeded?: boolean;
   isSeeded?: boolean;
+  ai_extracted?: boolean;
+  ai_confidence?: number;
+  ai_model_used?: string;
+  review_needed?: boolean;
+  match_score?: number;
+  match_explanation?: string;
 }
 
 interface HourlyReport {
@@ -122,7 +128,6 @@ interface HourlyReport {
   duplicate_jobs_skipped: number;
   companies_scanned: number;
 }
-
 interface JobsState {
   status: 'idle' | 'running' | 'completed';
   lastRunTime: string | null;
@@ -130,6 +135,14 @@ interface JobsState {
   jobs: Job[];
   logs: string[];
   reports?: HourlyReport[];
+  queueStats?: {
+    discovery: any;
+    crawl: any;
+    enrichment: any;
+    dedupe: any;
+    activeWorkers: number;
+    hpaReplicas: number;
+  };
 }
 
 interface FilterGroup {
@@ -263,10 +276,56 @@ export default function CombinedDashboard() {
   const [activeTab, setActiveTab] = useState<'companies' | 'jobs'>('jobs');
   const [mounted, setMounted] = useState(false);
 
+  // ─── AI FEATURE STATES ──────────────────────────────────────────
+  const [aiEnabled, setAiEnabled] = useState(true);
+  const [aiModel, setAiModel] = useState('openai/gpt-oss-120b:free');
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.5);
+  const [freshnessThreshold, setFreshnessThreshold] = useState(30);
+
+  // NL Search States
+  const [nlSearchActive, setNlSearchActive] = useState(false);
+  const [aiSearchResults, setAiSearchResults] = useState<Job[] | null>(null);
+  const [aiSearchLoading, setAiSearchLoading] = useState(false);
+
+  // AI Insights States
+  const [aiInsights, setAiInsights] = useState<any | null>(null);
+  const [aiInsightsLoading, setAiInsightsLoading] = useState(false);
+
+  // AI Model Status Tracker States
+  const [modelStatuses, setModelStatuses] = useState<Record<string, any>>({});
+  const [modelStatusesLoading, setModelStatusesLoading] = useState(false);
+
   // Set mounted flag to avoid Next SSR issues with Recharts
   useEffect(() => {
     setMounted(true);
   }, []);
+
+  // Load AI configuration from localStorage on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const storedEnabled = localStorage.getItem('radar_ai_enabled');
+      if (storedEnabled !== null) setAiEnabled(storedEnabled === 'true');
+      
+      const storedModel = localStorage.getItem('radar_ai_model');
+      if (storedModel !== null) setAiModel(storedModel);
+      
+      const storedConfidence = localStorage.getItem('radar_ai_confidence');
+      if (storedConfidence !== null) setConfidenceThreshold(parseFloat(storedConfidence));
+      
+      const storedFreshness = localStorage.getItem('radar_ai_freshness');
+      if (storedFreshness !== null) setFreshnessThreshold(parseInt(storedFreshness));
+    }
+  }, []);
+
+  // Save AI configuration to localStorage when changed
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('radar_ai_enabled', String(aiEnabled));
+      localStorage.setItem('radar_ai_model', aiModel);
+      localStorage.setItem('radar_ai_confidence', String(confidenceThreshold));
+      localStorage.setItem('radar_ai_freshness', String(freshnessThreshold));
+    }
+  }, [aiEnabled, aiModel, confidenceThreshold, freshnessThreshold]);
 
   // Toasts state
   const [toasts, setToasts] = useState<{ id: number; msg: string; type: 'ok' | 'err' | 'info' }[]>([]);
@@ -304,6 +363,7 @@ export default function CombinedDashboard() {
   const [settingConcurrency, setSettingConcurrency] = useState<number>(5);
   const [settingBlacklist, setSettingBlacklist] = useState<string>('');
   const [settingScamKeywords, setSettingScamKeywords] = useState<string>('');
+  const [settingScraperInterval, setSettingScraperInterval] = useState<number>(10);
 
   // Import Modal State
   const [importModalOpen, setImportModalOpen] = useState(false);
@@ -517,6 +577,21 @@ export default function CombinedDashboard() {
       delayMs: settingDelay,
       concurrency: settingConcurrency
     });
+
+    try {
+      const res = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'set_interval', interval: settingScraperInterval })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setJobsState(data);
+      }
+    } catch (err) {
+      console.error('Failed to update scraper interval:', err);
+    }
+
     setSettingsModalOpen(false);
   };
 
@@ -974,6 +1049,9 @@ export default function CombinedDashboard() {
         const data = await res.json();
         setJobsState(data);
         setJobScanPolling(data.status === 'running');
+        if (data.intervalMins) {
+          setSettingScraperInterval(data.intervalMins);
+        }
         if (selectedJobForDrawer) {
           const fresh = data.jobs.find((j: Job) => j.job_id === selectedJobForDrawer.job_id);
           if (fresh) setSelectedJobForDrawer(fresh);
@@ -1034,9 +1112,94 @@ export default function CombinedDashboard() {
     return () => clearInterval(interval);
   }, [jobsState?.jobs]);
 
+  const handleNlSearch = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!jobsSearch.trim()) {
+      setAiSearchResults(null);
+      setNlSearchActive(false);
+      return;
+    }
+    setAiSearchLoading(true);
+    setNlSearchActive(true);
+    try {
+      const res = await fetch('/api/ai-search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ query: jobsSearch })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAiSearchResults(data.jobs || []);
+        toast(`✨ AI parsed your query and found ${data.count} ranked jobs.`, 'ok');
+      } else {
+        toast('AI Search failed to parse query', 'err');
+      }
+      fetchAiStatuses();
+    } catch {
+      toast('AI Search request failed', 'err');
+    } finally {
+      setAiSearchLoading(false);
+    }
+  };
+
+  const fetchAiStatuses = useCallback(async () => {
+    setModelStatusesLoading(true);
+    try {
+      const res = await fetch('/api/ai-status');
+      if (res.ok) {
+        const data = await res.json();
+        if (data.statuses) setModelStatuses(data.statuses);
+      }
+    } catch (err) {
+      console.error('Error fetching AI statuses:', err);
+    } finally {
+      setModelStatusesLoading(false);
+    }
+  }, []);
+
+  const fetchAiInsights = useCallback(async () => {
+    setAiInsightsLoading(true);
+    try {
+      const res = await fetch('/api/ai-insights');
+      if (res.ok) {
+        const data = await res.json();
+        setAiInsights(data);
+      }
+    } catch (err) {
+      console.error('Error fetching AI insights:', err);
+    } finally {
+      setAiInsightsLoading(false);
+    }
+  }, []);
+
+  const handleAiEnrichFeed = async () => {
+    toast('Enriching jobs database with AI...', 'info');
+    try {
+      const res = await fetch('/api/jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action: 'ai_enrich_all' })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast(data.message || '✨ Started AI enrichment in the background!', 'ok');
+        fetchJobsState();
+        fetchAiStatuses();
+      } else {
+        toast(data.error || 'Failed to enrich feed', 'err');
+      }
+    } catch (err: any) {
+      toast(err.message || 'AI enrichment call failed.', 'err');
+    }
+  };
+
   useEffect(() => {
-    if (activeTab === 'jobs') fetchJobsState();
-  }, [activeTab, fetchJobsState]);
+    if (activeTab === 'jobs') {
+      fetchJobsState();
+      fetchAiInsights();
+      fetchAiStatuses();
+    }
+  }, [activeTab, fetchJobsState, fetchAiInsights, fetchAiStatuses]);
 
   useEffect(() => {
     if (!jobScanPolling) return;
@@ -2640,6 +2803,33 @@ export default function CombinedDashboard() {
         {activeTab === 'jobs' && (
           <div className="space-y-6 animate-in fade-in duration-200">
 
+            {/* Model rate-limited warning banner */}
+            {Object.values(modelStatuses).some((m: any) => m.status === 'rate_limited') && (
+              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-4.5 flex items-start gap-3 shadow-2xs animate-in slide-in-from-top-2 duration-300">
+                <div className="p-2 bg-rose-100/70 rounded-lg text-rose-805">
+                  <AlertTriangle className="w-5 h-5 text-rose-700 animate-bounce" />
+                </div>
+                <div className="flex-1 space-y-1">
+                  <h4 className="text-xs font-black text-rose-900 uppercase tracking-wider">
+                    OpenRouter API Rate Limit Exceeded
+                  </h4>
+                  <p className="text-[11px] text-rose-700 leading-relaxed font-semibold">
+                    One or more AI models have hit their daily OpenRouter free-tier rate limits (429). 
+                    The dashboard is automatically falling back to local heuristic engines to classify, rank, and score jobs without interruption.
+                  </p>
+                  <div className="flex flex-wrap gap-2 mt-2.5">
+                    {Object.values(modelStatuses)
+                      .filter((m: any) => m.status === 'rate_limited')
+                      .map((m: any) => (
+                        <span key={m.modelId} className="text-[9.5px] font-black bg-rose-100 text-rose-800 px-2.5 py-0.5 rounded-sm uppercase tracking-wider border border-rose-200/50">
+                          {m.modelId.split('/').pop()} (429)
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Top Executive KPI strip of 10 live stats cards */}
             <div className="grid grid-cols-2 md:grid-cols-5 lg:grid-cols-10 gap-3">
               {[
@@ -2713,6 +2903,146 @@ export default function CombinedDashboard() {
                     </div>
                   </div>
                 </div>
+
+                {/* Distributed Queue & Worker Autoscale Status */}
+                <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-2xs flex flex-col gap-4 animate-in fade-in duration-300">
+                  <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-2.5 flex items-center gap-1.5">
+                    <Activity className="w-4 h-4 text-indigo-650 animate-pulse" />
+                    Distributed Queue & Worker Status
+                  </h3>
+                  <div className="space-y-3.5">
+                    {/* Discovery Queue */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs font-semibold text-slate-700">
+                        <span>Discovery Queue</span>
+                        <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px]">
+                          {jobsState?.queueStats?.discovery?.waiting || 0} waiting
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                        <div 
+                          className="bg-indigo-500 h-full rounded-full transition-all duration-500" 
+                          style={{ width: `${Math.min(100, (((jobsState?.queueStats?.discovery?.waiting || 0) + (jobsState?.queueStats?.discovery?.active || 0)) / 100) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Crawl Queue */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs font-semibold text-slate-700">
+                        <span>Crawl Queue</span>
+                        <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px]">
+                          {jobsState?.queueStats?.crawl?.waiting || 0} waiting
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                        <div 
+                          className="bg-indigo-600 h-full rounded-full transition-all duration-500" 
+                          style={{ width: `${Math.min(100, (((jobsState?.queueStats?.crawl?.waiting || 0) + (jobsState?.queueStats?.crawl?.active || 0)) / 100) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* AI Enrichment Queue */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs font-semibold text-slate-700">
+                        <span>AI Enrichment Queue</span>
+                        <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px]">
+                          {jobsState?.queueStats?.enrichment?.waiting || 0} waiting
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                        <div 
+                          className="bg-violet-600 h-full rounded-full transition-all duration-500" 
+                          style={{ width: `${Math.min(100, (((jobsState?.queueStats?.enrichment?.waiting || 0) + (jobsState?.queueStats?.enrichment?.active || 0)) / 100) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Deduplication Queue */}
+                    <div className="space-y-1">
+                      <div className="flex justify-between text-xs font-semibold text-slate-700">
+                        <span>Dedupe Queue</span>
+                        <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded text-[10px]">
+                          {jobsState?.queueStats?.dedupe?.waiting || 0} waiting
+                        </span>
+                      </div>
+                      <div className="w-full bg-slate-100 h-1.5 rounded-full overflow-hidden">
+                        <div 
+                          className="bg-emerald-600 h-full rounded-full transition-all duration-500" 
+                          style={{ width: `${Math.min(100, (((jobsState?.queueStats?.dedupe?.waiting || 0) + (jobsState?.queueStats?.dedupe?.active || 0)) / 100) * 100)}%` }}
+                        />
+                      </div>
+                    </div>
+
+                    {/* Autoscaler HPA active workers */}
+                    <div className="pt-2 border-t border-slate-100 flex items-center justify-between text-xs">
+                      <div className="flex flex-col">
+                        <span className="font-bold text-slate-800">Worker Instances (HPA)</span>
+                        <span className="text-[10px] text-slate-400">Scaling range: 5 - 100 pods</span>
+                      </div>
+                      <span className="font-mono bg-emerald-50 text-emerald-700 font-bold px-2.5 py-1 rounded border border-emerald-200 flex items-center gap-1.5 animate-pulse">
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                        {jobsState?.queueStats?.hpaReplicas || 5} Pods
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* AI Model Status Tracker card */}
+                {mounted && (
+                  <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-2xs flex flex-col gap-4">
+                    <h3 className="text-xs font-bold text-slate-800 uppercase tracking-wider border-b border-slate-100 pb-2.5 flex items-center gap-1.5">
+                      <Activity className="w-4 h-4 text-indigo-605 animate-pulse" />
+                      AI Model Status Tracker
+                    </h3>
+                    <div className="space-y-3 text-[11px]">
+                      {Object.keys(modelStatuses).length === 0 ? (
+                        <div className="text-slate-400 py-1.5 flex items-center gap-1.5">
+                          <Info className="w-4 h-4 text-slate-400" />
+                          No models queried yet in this session
+                        </div>
+                      ) : (
+                        Object.values(modelStatuses).map((m: any) => {
+                          const simpleName = m.modelId.split('/').pop() || m.modelId;
+                          let statusColor = 'bg-slate-50 text-slate-650 border-slate-200';
+                          let statusDot = 'bg-slate-400';
+                          let label = 'Idle';
+
+                          if (m.status === 'active') {
+                            statusColor = 'bg-emerald-50 text-emerald-700 border-emerald-200/50';
+                            statusDot = 'bg-emerald-500';
+                            label = 'Online';
+                          } else if (m.status === 'rate_limited') {
+                            statusColor = 'bg-rose-50 text-rose-700 border-rose-200/50';
+                            statusDot = 'bg-rose-500 animate-ping';
+                            label = 'Rate Limited (429)';
+                          } else if (m.status === 'error') {
+                            statusColor = 'bg-amber-50 text-amber-700 border-amber-200/50';
+                            statusDot = 'bg-amber-500';
+                            label = 'Error';
+                          } else if (m.status === 'disabled') {
+                            statusColor = 'bg-slate-100 text-slate-500 border-slate-200';
+                            statusDot = 'bg-slate-400';
+                            label = 'Disabled';
+                          }
+
+                          return (
+                            <div key={m.modelId} className="flex justify-between items-center py-1 border-b border-slate-50 last:border-0">
+                              <span className="font-bold text-slate-650 max-w-[170px] truncate" title={m.modelId}>
+                                {simpleName}
+                              </span>
+                              <span className={`flex items-center gap-1 px-1.5 py-0.5 border text-[9px] font-extrabold rounded-xs ${statusColor}`}>
+                                <span className={`w-1 h-1 rounded-full ${statusDot}`} />
+                                {label}
+                              </span>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
+                  </div>
+                )}
 
                 {/* India Tech Hubs Hiring Heatmap list */}
                 <div className="bg-white rounded-2xl border border-slate-200 p-5 shadow-2xs flex flex-col gap-4">
@@ -2988,7 +3318,7 @@ export default function CombinedDashboard() {
                       <div className="flex flex-col">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2.5 block">Discovery Timeline (New Jobs)</span>
                         <div className="h-[150px] w-full relative min-w-0">
-                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                          <ResponsiveContainer width="100%" height={150} minWidth={0}>
                             <AreaChart data={chartsData.dailyHistory} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                               <defs>
                                 <linearGradient id="colorJobs" x1="0" y1="0" x2="0" y2="1">
@@ -3009,7 +3339,7 @@ export default function CombinedDashboard() {
                       <div className="flex flex-col">
                         <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2.5 block">Top Cities Vacancies Split</span>
                         <div className="h-[150px] w-full relative min-w-0">
-                          <ResponsiveContainer width="100%" height="100%" minWidth={0} minHeight={0}>
+                          <ResponsiveContainer width="100%" height={150} minWidth={0}>
                             <BarChart data={chartsData.cities} margin={{ top: 5, right: 5, left: -20, bottom: 5 }}>
                               <XAxis dataKey="name" stroke="#94a3b8" fontSize={10} tickLine={false} />
                               <YAxis stroke="#94a3b8" fontSize={10} tickLine={false} />
@@ -3330,6 +3660,20 @@ export default function CombinedDashboard() {
                   <option value="yahoo">Yahoo Search Only</option>
                   <option value="bing">Bing Search Only</option>
                   <option value="brave">Brave Search Only</option>
+                </select>
+              </div>
+
+              <div className="flex flex-col gap-1">
+                <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Background Scraper Interval</label>
+                <select
+                  value={settingScraperInterval}
+                  onChange={e => setSettingScraperInterval(Number(e.target.value))}
+                  className="border border-slate-200 rounded-xl px-3 py-2 text-xs bg-white outline-none font-semibold text-slate-700"
+                >
+                  <option value={10}>10 Minutes (Standard / Fast Discovery)</option>
+                  <option value={30}>30 Minutes</option>
+                  <option value={60}>1 Hour (Hourly / Power-saving)</option>
+                  <option value={120}>2 Hours</option>
                 </select>
               </div>
 

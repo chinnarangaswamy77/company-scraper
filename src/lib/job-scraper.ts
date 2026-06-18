@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import {
   dbUpsertJob,
+  dbUpsertAiJob,
   dbSaveHourlyReport,
   exportToCSV,
   saveRawScrapeLog,
@@ -15,6 +16,8 @@ import {
   dbClearJobs,
   isPgAvailable
 } from './db';
+import { isAiEnabled } from './ai/model-registry';
+import { aiExtractJob } from './ai/job-extractor';
 
 export interface JobScrapeState {
   status: 'idle' | 'running' | 'completed';
@@ -22,6 +25,7 @@ export interface JobScrapeState {
   nextRunTime: string | null;
   jobs: ScrapedJob[];
   logs: string[];
+  intervalMins?: number;
 }
 
 const JOBS_FILE = path.join(getScratchDir(), 'jobs_data.json');
@@ -106,7 +110,8 @@ export function loadJobState(): JobScrapeState {
     lastRunTime: null,
     nextRunTime: null,
     jobs: [],
-    logs: ['Jobs Discovery Agent database initialized.']
+    logs: ['Jobs Discovery Agent database initialized.'],
+    intervalMins: 10
   };
   saveJobState(inMemoryJobState);
   return inMemoryJobState;
@@ -136,8 +141,16 @@ const globalWithCron = global as typeof globalThis & {
   currentIntervalMinutes?: number;
 };
 
-export function startJobScraperCron() {
-  if (globalWithCron.currentIntervalMinutes === 10 && globalWithCron.backgroundCronInterval) {
+export function startJobScraperCron(intervalMins?: number) {
+  const state = loadJobState();
+  const finalInterval = intervalMins || state.intervalMins || 10;
+
+  if (state.intervalMins !== finalInterval) {
+    state.intervalMins = finalInterval;
+    saveJobState(state);
+  }
+
+  if (globalWithCron.currentIntervalMinutes === finalInterval && globalWithCron.backgroundCronInterval) {
     return;
   }
 
@@ -145,44 +158,43 @@ export function startJobScraperCron() {
     clearInterval(globalWithCron.backgroundCronInterval);
   }
 
-  const state = loadJobState();
-
   const scheduleNextRun = () => {
-    state.nextRunTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    state.nextRunTime = new Date(Date.now() + finalInterval * 60 * 1000).toISOString();
     saveJobState(state);
   };
 
-  if (!state.nextRunTime || globalWithCron.currentIntervalMinutes !== 10) {
+  if (!state.nextRunTime || globalWithCron.currentIntervalMinutes !== finalInterval) {
     scheduleNextRun();
   }
 
-  logJobMessage(state, '⏰ 10-Minute background Job Discovery Agent started.');
+  logJobMessage(state, `⏰ ${finalInterval}-Minute background Job Discovery Agent started.`);
   saveJobState(state);
 
   globalWithCron.backgroundCronInterval = setInterval(async () => {
     const currentState = loadJobState();
     currentState.lastRunTime = new Date().toISOString();
-    currentState.nextRunTime = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    currentState.nextRunTime = new Date(Date.now() + finalInterval * 60 * 1000).toISOString();
     saveJobState(currentState);
 
     try {
       await runJobScraper();
     } catch (err: any) {
-      console.error('10-minute job discovery run failed:', err.message);
+      console.error(`${finalInterval}-minute job discovery run failed:`, err.message);
     }
-  }, 10 * 60 * 1000); // 10 minutes
+  }, finalInterval * 60 * 1000);
 
-  globalWithCron.currentIntervalMinutes = 10;
+  globalWithCron.currentIntervalMinutes = finalInterval;
 }
 
 export function stopJobScraperCron() {
+  const state = loadJobState();
+  const currentInt = globalWithCron.currentIntervalMinutes || state.intervalMins || 10;
   if (globalWithCron.backgroundCronInterval) {
     clearInterval(globalWithCron.backgroundCronInterval);
     globalWithCron.backgroundCronInterval = undefined;
   }
   globalWithCron.currentIntervalMinutes = undefined;
-  const state = loadJobState();
-  logJobMessage(state, '🛑 10-Minute background Job Discovery Agent stopped.');
+  logJobMessage(state, `🛑 ${currentInt}-Minute background Job Discovery Agent stopped.`);
   saveJobState(state);
 }
 
@@ -317,6 +329,12 @@ export function parseCompanyAndTitle(urlStr: string, titleStr: string): { compan
   }
 
   parsedTitle = parsedTitle
+    // Strip leading count-prefixes like "50+ ", "21+ ", "100+ "
+    .replace(/^\d+\+?\s+/g, '')
+    // Strip trailing "Jobs in <location>", "Jobs in", "Jobs" noise from listing pages
+    .replace(/\s+[Jj]obs\s+in\b.*/g, '')
+    .replace(/\s+[Jj]obs\b\s*$/g, '')
+    // Strip location words
     .replace(/\s*(?:India|Bengaluru|Bangalore|Hyderabad|Pune|Mumbai|Delhi|Noida|Gurgaon|Gurugram|Chennai|Kochi|Trivandrum|Remote)\b/gi, '')
     .replace(/[^a-zA-Z0-9\s+#\-\.]/g, '')
     .replace(/\s+/g, ' ')
@@ -1402,9 +1420,12 @@ export function isValidJobPage(urlStr: string, titleStr: string): boolean {
     if (path === '/' || path === '' || path === '/jobs' || path === '/jobs/') return false;
   } catch { return false; }
 
-  // Skip generic list-page titles
+  // Skip generic list-page titles (e.g. "50+ Frontend Developer Jobs in India", "21+ Internship Jobs")
+  if (/^\d+\+?\s/i.test(title)) return false;
   if (/\b\d+\+\s*(jobs|openings|vacancies|results)\b/i.test(title)) return false;
   if (/(dream job|job vacancies|job openings|all jobs|search results)/i.test(title)) return false;
+  // Also filter out titles that still contain "X Jobs in" or "X Jobs" as listing-page noise
+  if (/\bjobs\s+in\b/i.test(title) && /^\d/.test(title.trim())) return false;
 
   // Require at least one role keyword in the title so we get actual postings
   const roleKeywords = [
@@ -1708,47 +1729,79 @@ export async function runJobScraper() {
     }
 
     // ── Phase 1-A: Greenhouse direct JSON API ─────────────────────────────────
-    logJobMessage(jobsState, '🏢 Phase 1-A: Greenhouse API...');
+    logJobMessage(jobsState, '🏢 Phase 1-A: Greenhouse API (batch-parallel)...');
     saveJobState(jobsState);
     let p1Total = 0;
-    for (const slug of GREENHOUSE_COMPANIES) {
-      const jobs = await fetchGreenhouseJobs(slug);
-      const n = ingestItems(jobs, 'Greenhouse');
-      if (n > 0) logJobMessage(jobsState, `  ✅ Greenhouse/${slug}: ${n} India jobs`);
-      p1Total += n;
+    const ghBatchSize = 6;
+    for (let i = 0; i < GREENHOUSE_COMPANIES.length; i += ghBatchSize) {
+      const batch = GREENHOUSE_COMPANIES.slice(i, i + ghBatchSize);
+      const results = await Promise.allSettled(batch.map(slug => fetchGreenhouseJobs(slug)));
+      results.forEach((r, idx) => {
+        const slug = batch[idx];
+        if (r.status === 'fulfilled' && r.value.length > 0) {
+          const n = ingestItems(r.value, 'Greenhouse');
+          if (n > 0) logJobMessage(jobsState, `  ✅ Greenhouse/${slug}: ${n} India jobs`);
+          p1Total += n;
+        }
+      });
+      saveJobState(jobsState);
       await new Promise(r => setTimeout(r, 150));
     }
 
     // ── Phase 1-B: Lever direct JSON API ─────────────────────────────────────
-    logJobMessage(jobsState, '🏢 Phase 1-B: Lever API...');
+    logJobMessage(jobsState, '🏢 Phase 1-B: Lever API (batch-parallel)...');
     saveJobState(jobsState);
-    for (const slug of LEVER_COMPANIES) {
-      const jobs = await fetchLeverJobs(slug);
-      const n = ingestItems(jobs, 'Lever');
-      if (n > 0) logJobMessage(jobsState, `  ✅ Lever/${slug}: ${n} India jobs`);
-      p1Total += n;
+    const leverBatchSize = 6;
+    for (let i = 0; i < LEVER_COMPANIES.length; i += leverBatchSize) {
+      const batch = LEVER_COMPANIES.slice(i, i + leverBatchSize);
+      const results = await Promise.allSettled(batch.map(slug => fetchLeverJobs(slug)));
+      results.forEach((r, idx) => {
+        const slug = batch[idx];
+        if (r.status === 'fulfilled' && r.value.length > 0) {
+          const n = ingestItems(r.value, 'Lever');
+          if (n > 0) logJobMessage(jobsState, `  ✅ Lever/${slug}: ${n} India jobs`);
+          p1Total += n;
+        }
+      });
+      saveJobState(jobsState);
       await new Promise(r => setTimeout(r, 150));
     }
 
     // ── Phase 1-C: Ashby direct API ───────────────────────────────────────────
-    logJobMessage(jobsState, '🏢 Phase 1-C: Ashby API...');
+    logJobMessage(jobsState, '🏢 Phase 1-C: Ashby API (batch-parallel)...');
     saveJobState(jobsState);
-    for (const slug of ASHBY_COMPANIES) {
-      const jobs = await fetchAshbyJobs(slug);
-      const n = ingestItems(jobs, 'Ashby');
-      if (n > 0) logJobMessage(jobsState, `  ✅ Ashby/${slug}: ${n} India jobs`);
-      p1Total += n;
+    const ashbyBatchSize = 6;
+    for (let i = 0; i < ASHBY_COMPANIES.length; i += ashbyBatchSize) {
+      const batch = ASHBY_COMPANIES.slice(i, i + ashbyBatchSize);
+      const results = await Promise.allSettled(batch.map(slug => fetchAshbyJobs(slug)));
+      results.forEach((r, idx) => {
+        const slug = batch[idx];
+        if (r.status === 'fulfilled' && r.value.length > 0) {
+          const n = ingestItems(r.value, 'Ashby');
+          if (n > 0) logJobMessage(jobsState, `  ✅ Ashby/${slug}: ${n} India jobs`);
+          p1Total += n;
+        }
+      });
+      saveJobState(jobsState);
       await new Promise(r => setTimeout(r, 150));
     }
 
     // ── Phase 1-D: SmartRecruiters API ───────────────────────────────────────
-    logJobMessage(jobsState, '🏢 Phase 1-D: SmartRecruiters API...');
+    logJobMessage(jobsState, '🏢 Phase 1-D: SmartRecruiters API (batch-parallel)...');
     saveJobState(jobsState);
-    for (const slug of SMARTRECRUITERS_COMPANIES) {
-      const jobs = await fetchSmartRecruitersJobs(slug);
-      const n = ingestItems(jobs, 'SmartRecruiters');
-      if (n > 0) logJobMessage(jobsState, `  ✅ SmartRecruiters/${slug}: ${n} India jobs`);
-      p1Total += n;
+    const srBatchSize = 6;
+    for (let i = 0; i < SMARTRECRUITERS_COMPANIES.length; i += srBatchSize) {
+      const batch = SMARTRECRUITERS_COMPANIES.slice(i, i + srBatchSize);
+      const results = await Promise.allSettled(batch.map(slug => fetchSmartRecruitersJobs(slug)));
+      results.forEach((r, idx) => {
+        const slug = batch[idx];
+        if (r.status === 'fulfilled' && r.value.length > 0) {
+          const n = ingestItems(r.value, 'SmartRecruiters');
+          if (n > 0) logJobMessage(jobsState, `  ✅ SmartRecruiters/${slug}: ${n} India jobs`);
+          p1Total += n;
+        }
+      });
+      saveJobState(jobsState);
       await new Promise(r => setTimeout(r, 200));
     }
 
@@ -1759,7 +1812,7 @@ export async function runJobScraper() {
     logJobMessage(jobsState, '📰 Phase 2-A: Indeed India RSS feeds...');
     saveJobState(jobsState);
     let p2Total = 0;
-    for (const role of INDIA_ROLE_QUERIES.slice(0, 12)) { // top 12 roles
+    for (const role of INDIA_ROLE_QUERIES.slice(0, 24)) { // Top 24 roles (engineering, data, design)
       const [all, ...cityResults] = await Promise.allSettled([
         fetchIndeedRSS(role, 'India'),
         ...INDIA_CITIES.slice(0, 4).map(city => fetchIndeedRSS(role, city))
@@ -1777,7 +1830,7 @@ export async function runJobScraper() {
     // ── Phase 2-B: Naukri RSS (role × city) ──────────────────────────────────
     logJobMessage(jobsState, '📰 Phase 2-B: Naukri RSS feeds...');
     saveJobState(jobsState);
-    for (const role of INDIA_ROLE_QUERIES.slice(0, 10)) {
+    for (const role of INDIA_ROLE_QUERIES.slice(0, 20)) { // Top 20 roles
       const results = await Promise.allSettled([
         fetchNaukriRSS(role, ''),
         ...INDIA_CITIES.slice(0, 3).map(city => fetchNaukriRSS(role, city))
@@ -1792,7 +1845,7 @@ export async function runJobScraper() {
     // ── Phase 2-C: TimesJobs RSS ──────────────────────────────────────────────
     logJobMessage(jobsState, '📰 Phase 2-C: TimesJobs RSS...');
     saveJobState(jobsState);
-    for (const role of INDIA_ROLE_QUERIES.slice(0, 8)) {
+    for (const role of INDIA_ROLE_QUERIES.slice(0, 16)) { // Top 16 roles
       const jobs = await fetchTimesJobsRSS(role);
       const n = ingestItems(jobs, 'TimesJobs');
       if (n > 0) logJobMessage(jobsState, `  📰 TimesJobs "${role}": ${n} jobs`);
@@ -1803,7 +1856,7 @@ export async function runJobScraper() {
     // ── Phase 2-D: Shine RSS ──────────────────────────────────────────────────
     logJobMessage(jobsState, '📰 Phase 2-D: Shine RSS...');
     saveJobState(jobsState);
-    for (const role of INDIA_ROLE_QUERIES.slice(0, 8)) {
+    for (const role of INDIA_ROLE_QUERIES.slice(0, 16)) { // Top 16 roles
       const jobs = await fetchShineRSS(role);
       const n = ingestItems(jobs, 'Shine');
       if (n > 0) logJobMessage(jobsState, `  📰 Shine "${role}": ${n} jobs`);
@@ -1874,6 +1927,13 @@ export async function runJobScraper() {
     saveJobState(jobsState);
 
     // --- Phase 2: Search engine sweep (best-effort, timeouts are normal) ---
+    const searchTally = {
+      DuckDuckGo: { ok: 0, err: 0 },
+      Yahoo: { ok: 0, err: 0 },
+      Bing: { ok: 0, err: 0 },
+      Brave: { ok: 0, err: 0 }
+    };
+
     for (let i = 0; i < DISCOVERY_QUERIES.length; i++) {
       const q = DISCOVERY_QUERIES[i];
       try {
@@ -1890,13 +1950,16 @@ export async function runJobScraper() {
           ]);
           
           settled.forEach((r, idx) => {
-            const engineNames = ['DuckDuckGo', 'Yahoo', 'Bing', 'Brave'];
+            const engineNames = ['DuckDuckGo', 'Yahoo', 'Bing', 'Brave'] as const;
+            const name = engineNames[idx];
             if (r.status === 'fulfilled') {
+              searchTally[name].ok++;
               if (r.value.length > 0) {
                 searchResults.push(...r.value);
               }
             } else {
-              console.warn(`Search engine ${engineNames[idx]} failed:`, r.reason?.message || r.reason);
+              searchTally[name].err++;
+              console.debug(`Search engine ${name} failed:`, r.reason?.message || r.reason);
             }
           });
           
@@ -1914,7 +1977,9 @@ export async function runJobScraper() {
           const urlStr = res.url.split('?')[0];
           if (seenUrls.has(urlStr.toLowerCase())) return;
 
-          if (!isValidJobPage(res.url, res.title)) {
+          const { company, title } = parseCompanyAndTitle(res.url, res.title);
+
+          if (!isValidJobPage(res.url, title)) {
             return;
           }
 
@@ -1924,8 +1989,6 @@ export async function runJobScraper() {
           }
 
           seenUrls.add(urlStr.toLowerCase());
-
-          const { company, title } = parseCompanyAndTitle(res.url, res.title);
 
           let sourceName = 'Company Careers';
           if (res.url.includes('lever.co')) { sourceName = 'Lever'; }
@@ -2055,6 +2118,7 @@ export async function runJobScraper() {
       await new Promise(resolve => setTimeout(resolve, 800));
     }
 
+    logJobMessage(jobsState, `📊 Search Engines Tally: DuckDuckGo (ok: ${searchTally.DuckDuckGo.ok}, err: ${searchTally.DuckDuckGo.err}), Yahoo (ok: ${searchTally.Yahoo.ok}, err: ${searchTally.Yahoo.err}), Bing (ok: ${searchTally.Bing.ok}, err: ${searchTally.Bing.err}), Brave (ok: ${searchTally.Brave.ok}, err: ${searchTally.Brave.err})`);
     logJobMessage(jobsState, `✅ Crawl completed. Processing ${rawDiscoveredJobs.length} opportunities...`);
     saveJobState(jobsState);
 
@@ -2122,6 +2186,51 @@ export async function runJobScraper() {
       });
     }
 
+    // ─── Phase 3: AI Enrichment (only if OPENROUTER_API_KEY is set) ───
+    if (isAiEnabled()) {
+      logJobMessage(jobsState, '✨ Phase 3: AI Enrichment starting for newly discovered search results...');
+      saveJobState(jobsState);
+
+      const atsSources = ['Greenhouse', 'Lever', 'Ashby', 'SmartRecruiters'];
+      const toEnrich = uniqueCandidateJobs.filter(j => !atsSources.includes(j.source_name || ''));
+
+      logJobMessage(jobsState, `🧠 Queueing ${toEnrich.length} jobs for AI enrichment...`);
+      saveJobState(jobsState);
+
+      const batchSize = 5;
+      for (let i = 0; i < toEnrich.length; i += batchSize) {
+        const batch = toEnrich.slice(i, i + batchSize);
+        await Promise.allSettled(
+          batch.map(async (job) => {
+            try {
+              const res = await aiExtractJob(job.job_url);
+              if (res.success && res.scrapedJobFields) {
+                const idx = uniqueCandidateJobs.findIndex(cj => cj.job_id === job.job_id);
+                if (idx !== -1) {
+                  uniqueCandidateJobs[idx] = {
+                    ...uniqueCandidateJobs[idx],
+                    ...res.scrapedJobFields,
+                    ai_extracted: true
+                  } as ScrapedJob;
+                  logJobMessage(jobsState, `✨ AI Enriched: "${job.job_title}" at ${job.company_name} (conf: ${res.confidence.toFixed(2)})`);
+                }
+              } else {
+                logJobMessage(jobsState, `⚠️ AI Enrichment failed/skipped for "${job.job_title}": ${res.error || 'unsupported'}`);
+              }
+            } catch (err: any) {
+              console.error(`Error enriching job ${job.job_url}:`, err.message);
+            }
+          })
+        );
+        saveJobState(jobsState);
+        if (i + batchSize < toEnrich.length) {
+          await new Promise(r => setTimeout(r, 200));
+        }
+      }
+      logJobMessage(jobsState, '✨ Phase 3: AI Enrichment complete.');
+      saveJobState(jobsState);
+    }
+
     // Comparison Engine (OPEN vs CLOSED vs UPDATED)
     const previousJobsMap = new Map<string, ScrapedJob>();
     const previousJobsList = isPgAvailable ? await dbLoadJobs() : jobsState.jobs;
@@ -2183,13 +2292,15 @@ export async function runJobScraper() {
           status: 'OPEN'
         };
         nextJobsStateList.push(updatedJob);
-        dbUpsertJob(updatedJob).catch(err => console.error(err));
+        const upsert = updatedJob.ai_extracted ? dbUpsertAiJob : dbUpsertJob;
+        upsert(updatedJob).catch(err => console.error(err));
       } else {
         // Genuinely new job
         discoveredJobIds.add(job.job_id);
         nextJobsStateList.push(job);
         newJobsFound++;
-        dbUpsertJob(job).catch(err => console.error(err));
+        const upsert = job.ai_extracted ? dbUpsertAiJob : dbUpsertJob;
+        upsert(job).catch(err => console.error(err));
       }
     }
 
@@ -2281,3 +2392,509 @@ const SKILLS_DICT = [
   'Product Management', 'Agile', 'Scrum', 'Figma', 'UI/UX', 'Design',
   'Cybersecurity', 'Security', 'Android', 'iOS', 'Flutter', 'React Native'
 ];
+
+export async function runCustomJobSearch(
+  query: string,
+  engines: string[] = ['ddg', 'yahoo', 'bing', 'brave'],
+  indiaOnly: boolean = true
+): Promise<any[]> {
+  const searchResults: { url: string; title: string; description: string }[] = [];
+  const promises: Promise<{ url: string; title: string; description: string }[]>[] = [];
+
+  if (engines.includes('ddg')) promises.push(queryDDGJobs(query).catch(() => []));
+  if (engines.includes('yahoo')) promises.push(queryYahooJobs(query).catch(() => []));
+  if (engines.includes('bing')) promises.push(queryBingJobs(query).catch(() => []));
+  if (engines.includes('brave')) promises.push(queryBraveJobs(query).catch(() => []));
+
+  const settled = await Promise.allSettled(promises);
+  settled.forEach(r => {
+    if (r.status === 'fulfilled' && Array.isArray(r.value)) {
+      searchResults.push(...r.value);
+    }
+  });
+
+  const uniqueJobs: any[] = [];
+  const seenUrls = new Set<string>();
+
+  for (const res of searchResults) {
+    const urlStr = res.url.split('?')[0];
+    if (seenUrls.has(urlStr.toLowerCase())) continue;
+
+    const { company, title } = parseCompanyAndTitle(res.url, res.title);
+
+    if (!isValidJobPage(res.url, title)) {
+      continue;
+    }
+
+    if (indiaOnly && !isIndiaSearchResult(res.title, res.description, res.url)) {
+      continue;
+    }
+
+    seenUrls.add(urlStr.toLowerCase());
+
+    let sourceName = 'Company Careers';
+    if (res.url.includes('lever.co')) { sourceName = 'Lever'; }
+    else if (res.url.includes('greenhouse.io')) { sourceName = 'Greenhouse'; }
+    else if (res.url.includes('myworkdayjobs.com')) { sourceName = 'Workday'; }
+    else if (res.url.includes('ashbyhq.com')) { sourceName = 'Ashby'; }
+    else if (res.url.includes('smartrecruiters.com')) { sourceName = 'SmartRecruiters'; }
+    else if (res.url.includes('bamboohr.com')) { sourceName = 'BambooHR'; }
+    else if (res.url.includes('taleo.net') || res.url.includes('oraclecloud.com')) { sourceName = 'Taleo'; }
+    else if (res.url.includes('icims.com')) { sourceName = 'iCIMS'; }
+    else if (res.url.includes('successfactors.com') || res.url.includes('successfactors.eu')) { sourceName = 'SuccessFactors'; }
+    else if (res.url.includes('linkedin.com')) { sourceName = 'LinkedIn'; }
+    else if (res.url.includes('naukri.com')) { sourceName = 'Naukri'; }
+    else if (res.url.includes('indeed.co.in') || res.url.includes('indeed.com')) { sourceName = 'Indeed'; }
+    else if (res.url.includes('glassdoor.co.in') || res.url.includes('glassdoor.com')) { sourceName = 'Glassdoor'; }
+    else if (res.url.includes('wellfound.com')) { sourceName = 'Wellfound'; }
+    else if (res.url.includes('instahyre.com')) { sourceName = 'Instahyre'; }
+    else if (res.url.includes('cutshort.io')) { sourceName = 'CutShort'; }
+    else if (res.url.includes('hirist.tech') || res.url.includes('hirist.com')) { sourceName = 'Hirist'; }
+    else if (res.url.includes('internshala.com')) { sourceName = 'Internshala'; }
+    else if (res.url.includes('foundit.in')) { sourceName = 'Foundit'; }
+    else if (res.url.includes('monsterindia.com') || res.url.includes('monster.com')) { sourceName = 'Monster'; }
+    else if (res.url.includes('shine.com')) { sourceName = 'Shine'; }
+    else if (res.url.includes('ambitionbox.com')) { sourceName = 'AmbitionBox'; }
+
+    let careerPageUrl = '';
+    try {
+      const parsed = new URL(res.url);
+      if (sourceName === 'Lever') {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts.length > 0) {
+          careerPageUrl = `https://jobs.lever.co/${parts[0]}`;
+        }
+      } else if (sourceName === 'Greenhouse') {
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts.length > 0 && parts[0] !== 'embed') {
+          careerPageUrl = `https://boards.greenhouse.io/${parts[0]}`;
+        } else {
+          const forCompany = parsed.searchParams.get('for');
+          if (forCompany) {
+            careerPageUrl = `https://boards.greenhouse.io/${forCompany}`;
+          }
+        }
+      } else if (sourceName === 'Workday') {
+        careerPageUrl = `https://${parsed.hostname}/Careers`;
+      } else {
+        careerPageUrl = `${parsed.protocol}//${parsed.hostname}${parsed.pathname.split('/').slice(0, 2).join('/')}`;
+      }
+    } catch {
+      careerPageUrl = res.url;
+    }
+
+    let companyWebsite = '';
+    const isAts = ['Lever', 'Greenhouse', 'Workday', 'Ashby', 'SmartRecruiters', 'BambooHR', 'Taleo', 'iCIMS', 'SuccessFactors'].includes(sourceName);
+    const isJobBoard = ['LinkedIn', 'Naukri', 'Indeed', 'Glassdoor', 'Wellfound', 'Instahyre', 'CutShort', 'Hirist', 'Internshala', 'Foundit', 'Monster', 'Shine', 'AmbitionBox'].includes(sourceName);
+    if (!isAts && !isJobBoard) {
+      try {
+        const parsed = new URL(res.url);
+        companyWebsite = `${parsed.protocol}//${parsed.hostname}`;
+      } catch {}
+    }
+
+    const workMode = extractWorkMode(title, res.description);
+    const cityState = parseCityAndState(title, res.description, res.url, 'India');
+
+    const partialJob = {
+      job_title: title,
+      company_name: company,
+      company_website: companyWebsite,
+      career_page_url: careerPageUrl,
+      job_url: res.url,
+      location: cityState.city ? `${cityState.city}, ${cityState.state}, India` : 'India',
+      city: cityState.city,
+      state: cityState.state,
+      country: 'India',
+      employment_type: extractEmploymentType(title, res.description),
+      work_mode: workMode,
+      experience_required: extractExperience(title, res.description),
+      skills: extractSkills(title, res.description),
+      department: '',
+      posted_date: new Date().toISOString(),
+      application_deadline: '',
+      source_type: isJobBoard ? 'THIRD_PARTY' : 'OFFICIAL',
+      source_name: sourceName,
+      description: cleanHtmlText(res.description),
+      apply_url: res.url,
+
+      // Compatibility keys
+      id: '',
+      title: title,
+      companyName: company,
+      url: res.url,
+      scrapedAt: new Date().toISOString(),
+      postedDate: new Date().toISOString(),
+      remote: workMode === 'remote',
+      salary: '',
+      salary_range: ''
+    };
+
+    const fingerprint = generateJobFingerprint(partialJob);
+
+    uniqueJobs.push({
+      ...partialJob,
+      job_id: fingerprint,
+      job_fingerprint: fingerprint,
+      id: fingerprint,
+      title,
+      companyName: company,
+      url: res.url,
+      postedDate: new Date().toISOString(),
+      scrapedAt: new Date().toISOString()
+    });
+  }
+
+  return uniqueJobs;
+}
+
+export async function extractJobsFromUrl(urlStr: string): Promise<any[]> {
+  const url = urlStr.trim();
+  if (!url || !url.startsWith('http')) {
+    throw new Error('Invalid URL. URL must start with http:// or https://');
+  }
+
+  // 1. Check for ATS boards and use public JSON API
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const pathname = parsed.pathname;
+
+    // A. Greenhouse board
+    if (host.includes('greenhouse.io')) {
+      const parts = pathname.split('/').filter(Boolean);
+      let companySlug = '';
+      if (parts[0] === 'embed' && parts[1] === 'job_board') {
+        companySlug = parsed.searchParams.get('for') || '';
+      } else if (parts[0]) {
+        companySlug = parts[0];
+      }
+      if (companySlug && companySlug !== 'embed' && companySlug !== 'jobs') {
+        const jobs = await fetchGreenhouseJobs(companySlug);
+        if (jobs.length > 0) {
+          return formatJobItemsToScrapedJobs(jobs, 'Greenhouse', companySlug);
+        }
+      }
+    }
+
+    // B. Lever board
+    if (host.includes('lever.co')) {
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0]) {
+        const companySlug = parts[0];
+        if (parts.length === 1) {
+          const jobs = await fetchLeverJobs(companySlug);
+          if (jobs.length > 0) {
+            return formatJobItemsToScrapedJobs(jobs, 'Lever', companySlug);
+          }
+        }
+      }
+    }
+
+    // C. Ashby board
+    if (host.includes('ashbyhq.com')) {
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0] && parts.length === 1) {
+        const companySlug = parts[0];
+        const jobs = await fetchAshbyJobs(companySlug);
+        if (jobs.length > 0) {
+          return formatJobItemsToScrapedJobs(jobs, 'Ashby', companySlug);
+        }
+      }
+    }
+
+    // D. SmartRecruiters board
+    if (host.includes('smartrecruiters.com')) {
+      const parts = pathname.split('/').filter(Boolean);
+      if (parts[0] && parts.length === 1) {
+        const companySlug = parts[0];
+        const jobs = await fetchSmartRecruitersJobs(companySlug);
+        if (jobs.length > 0) {
+          return formatJobItemsToScrapedJobs(jobs, 'SmartRecruiters', companySlug);
+        }
+      }
+    }
+  } catch (e) {
+    console.error('Error checking ATS slug in extractJobsFromUrl:', e);
+  }
+
+  // 2. Fetch page HTML
+  const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': ua,
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Failed to fetch URL: ${response.status} ${response.statusText}`);
+  }
+
+  const html = await response.text();
+
+  // 3. Heuristics to decide if we parse it as multiple job links or a single job page.
+  const pageUrlObj = new URL(url);
+  const baseUrl = `${pageUrlObj.protocol}//${pageUrlObj.hostname}`;
+
+  const linkRegex = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  const uniqueLinks = new Map<string, string>(); // href -> link text
+
+  while ((match = linkRegex.exec(html)) !== null) {
+    const href = match[1].trim();
+    if (!href || href.startsWith('#') || href.startsWith('javascript:')) continue;
+    
+    try {
+      const absoluteUrl = new URL(href, url).href;
+      const cleanHref = absoluteUrl.split('?')[0].toLowerCase();
+      
+      if (isValidJobPage(absoluteUrl, match[2])) {
+        if (cleanHref !== url.split('?')[0].toLowerCase()) {
+          uniqueLinks.set(absoluteUrl, cleanHtmlText(match[2]));
+        }
+      }
+    } catch {}
+  }
+
+  // If we found more than 2 potential job links, treat the page as a Careers/List page!
+  if (uniqueLinks.size > 2) {
+    const discoveredJobs: any[] = [];
+    const company = extractCompanyNameFromUrl(url, html);
+
+    for (const [jobUrl, linkText] of uniqueLinks.entries()) {
+      const title = cleanJobTitle(linkText);
+      const cityState = parseCityAndState(title, '', jobUrl, 'India');
+      const workMode = extractWorkMode(title, jobUrl);
+      const skills = extractSkills(title, '');
+      
+      const partialJob = {
+        job_title: title,
+        company_name: company,
+        company_website: baseUrl,
+        career_page_url: url,
+        job_url: jobUrl,
+        location: cityState.city ? `${cityState.city}, ${cityState.state}, India` : 'India',
+        city: cityState.city,
+        state: cityState.state,
+        country: 'India',
+        employment_type: extractEmploymentType(title, ''),
+        work_mode: workMode,
+        experience_required: extractExperience(title, ''),
+        skills: skills,
+        department: '',
+        posted_date: new Date().toISOString(),
+        application_deadline: '',
+        source_type: 'OFFICIAL' as const,
+        source_name: 'Manual URL Extraction',
+        description: `Discovered job listing: ${title}. Visit ${jobUrl} to apply.`,
+        apply_url: jobUrl,
+
+        // Compatibility keys
+        id: '',
+        title: title,
+        companyName: company,
+        url: jobUrl,
+        scrapedAt: new Date().toISOString(),
+        postedDate: new Date().toISOString(),
+        remote: workMode === 'remote',
+        salary: '',
+        salary_range: ''
+      };
+
+      const fingerprint = generateJobFingerprint(partialJob);
+      discoveredJobs.push({
+        ...partialJob,
+        job_id: fingerprint,
+        job_fingerprint: fingerprint,
+        id: fingerprint
+      });
+    }
+
+    return discoveredJobs;
+  }
+
+  // Otherwise, treat the page as a single job posting!
+  const title = extractTitleFromHtml(html, url);
+  const company = extractCompanyNameFromUrl(url, html);
+  const description = extractDescriptionFromHtml(html);
+  
+  const cityState = parseCityAndState(title, description, url, 'India');
+  const workMode = extractWorkMode(title, description);
+  const skills = extractSkills(title, description);
+  const empType = extractEmploymentType(title, description);
+  const exp = extractExperience(title, description);
+
+  const partialJob = {
+    job_title: title,
+    company_name: company,
+    company_website: baseUrl,
+    career_page_url: url,
+    job_url: url,
+    location: cityState.city ? `${cityState.city}, ${cityState.state}, India` : 'India',
+    city: cityState.city,
+    state: cityState.state,
+    country: 'India',
+    employment_type: empType,
+    work_mode: workMode,
+    experience_required: exp,
+    skills: skills,
+    department: '',
+    posted_date: new Date().toISOString(),
+    application_deadline: '',
+    source_type: 'OFFICIAL' as const,
+    source_name: 'Manual URL Extraction',
+    description: description.slice(0, 1000) || `Job posting for ${title} at ${company}.`,
+    apply_url: url,
+
+    // Compatibility keys
+    id: '',
+    title: title,
+    companyName: company,
+    url: url,
+    scrapedAt: new Date().toISOString(),
+    postedDate: new Date().toISOString(),
+    remote: workMode === 'remote',
+    salary: '',
+    salary_range: ''
+  };
+
+  const fingerprint = generateJobFingerprint(partialJob);
+  return [{
+    ...partialJob,
+    job_id: fingerprint,
+    job_fingerprint: fingerprint,
+    id: fingerprint
+  }];
+}
+
+// Format JobItem[] from Greenhouse/Lever APIs into ScrapedJob objects
+function formatJobItemsToScrapedJobs(items: JobItem[], sourceName: string, companySlug: string): any[] {
+  return items.map(j => {
+    const company = j.companyName
+      ? j.companyName.replace(/\b\w/g, c => c.toUpperCase())
+      : companySlug.replace(/-/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const cityState = parseCityAndState(j.title, j.description, j.url, j.location);
+    const skills = extractSkills(j.title, j.description);
+    const workMode = extractWorkMode(j.title, `${j.description} ${j.location}`);
+    const empType = extractEmploymentType(j.title, j.description);
+    const exp = extractExperience(j.title, j.description);
+    const salary = extractSalary(j.title, j.description);
+    const fingerprint = generateJobFingerprint({ job_url: j.url, company_name: company, job_title: j.title, location: j.location });
+
+    const partialJob = {
+      job_title: j.title,
+      company_name: company,
+      company_website: j.companyName ? '' : '', // Let it be mapped correctly
+      career_page_url: j.url,
+      job_url: j.url,
+      location: cityState.city ? `${cityState.city}, ${cityState.state}, India` : j.location || 'India',
+      city: cityState.city,
+      state: cityState.state,
+      country: 'India',
+      employment_type: empType,
+      work_mode: workMode,
+      experience_required: exp,
+      skills: skills,
+      department: '',
+      posted_date: new Date().toISOString(),
+      application_deadline: '',
+      source_type: 'OFFICIAL' as const,
+      source_name: sourceName,
+      description: j.description || `Job posting for ${j.title} at ${company}.`,
+      apply_url: j.url,
+
+      // Compatibility keys
+      id: '',
+      title: j.title,
+      companyName: company,
+      url: j.url,
+      scrapedAt: new Date().toISOString(),
+      postedDate: new Date().toISOString(),
+      remote: workMode === 'remote',
+      salary: salary,
+      salary_range: salary
+    };
+
+    return {
+      ...partialJob,
+      job_id: fingerprint,
+      job_fingerprint: fingerprint,
+      id: fingerprint
+    };
+  });
+}
+
+function extractTitleFromHtml(html: string, url: string): string {
+  const ogTitleMatch = /<meta[^>]+property="og:title"[^>]+content="([^"]+)"/i.exec(html) ||
+                       /<meta[^>]+content="([^"]+)"[^>]+property="og:title"/i.exec(html);
+  if (ogTitleMatch) return cleanJobTitle(ogTitleMatch[1]);
+
+  const h1Match = /<h1[^>]*>([\s\S]*?)<\/h1>/i.exec(html);
+  if (h1Match) return cleanJobTitle(h1Match[1]);
+
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  if (titleMatch) return cleanJobTitle(titleMatch[1]);
+
+  return 'Job Opening';
+}
+
+function extractDescriptionFromHtml(html: string): string {
+  let bodyContent = html.replace(/<head[\s\S]*?<\/head>/gi, '')
+                        .replace(/<script[\s\S]*?<\/script>/gi, '')
+                        .replace(/<style[\s\S]*?<\/style>/gi, '')
+                        .replace(/<nav[\s\S]*?<\/nav>/gi, '')
+                        .replace(/<footer[\s\S]*?<\/footer>/gi, '');
+
+  let cleaned = bodyContent.replace(/<[^>]*>/g, ' ');
+
+  cleaned = cleaned
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, ' ');
+
+  cleaned = cleaned.replace(/\s+/g, ' ').trim();
+
+  return cleaned.slice(0, 3000);
+}
+
+function cleanJobTitle(title: string): string {
+  let clean = cleanHtmlText(title);
+  clean = clean.replace(/\s*[-|]\s*[A-Za-z0-9\s]+$/g, '');
+  clean = clean.replace(/\s+careers?\b/gi, '');
+  return clean.trim();
+}
+
+function extractCompanyNameFromUrl(urlStr: string, html: string): string {
+  const ogSiteMatch = /<meta[^>]+property="og:site_name"[^>]+content="([^"]+)"/i.exec(html) ||
+                      /<meta[^>]+content="([^"]+)"[^>]+property="og:site_name"/i.exec(html);
+  if (ogSiteMatch) return ogSiteMatch[1].trim();
+
+  const titleMatch = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html);
+  if (titleMatch) {
+    const titleText = cleanHtmlText(titleMatch[1]);
+    const atMatch = /\b(?:at|@|in|hiring at|careers at)\s+([A-Za-z0-9\s]+)/i.exec(titleText);
+    if (atMatch) {
+      return atMatch[1].trim().split('|')[0].split('-')[0].trim();
+    }
+  }
+
+  try {
+    const parsed = new URL(urlStr);
+    const parts = parsed.hostname.split('.');
+    let name = parts.length > 2 ? parts[parts.length - 2] : parts[0];
+    if (name === 'co' || name === 'com' || name === 'net' || name === 'org') {
+      name = parts[0];
+    }
+    return name.charAt(0).toUpperCase() + name.slice(1);
+  } catch {
+    return 'Live Discovered Co';
+  }
+}
+

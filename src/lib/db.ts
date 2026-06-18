@@ -28,6 +28,21 @@ export interface ScrapedJob {
   description: string;
   apply_url: string;
 
+  // AI enrichment fields (optional — populated after AI extraction)
+  ai_confidence?: number;      // 0.00–1.00 extraction confidence
+  ai_model_used?: string;      // e.g. "openai/gpt-oss-120b:free"
+  ai_extracted?: boolean;      // true if AI pipeline processed this job
+  review_needed?: boolean;     // true if confidence < 0.75
+  match_score?: number;        // 0–100 candidate match score
+  freshness_score?: number;    // 0–100 freshness score
+  composite_score?: number;    // weighted composite of match + freshness
+  tags?: string[];             // AI-generated category tags
+  salary_range?: string;       // raw salary string
+  language?: string;           // 'en', 'hi', etc.
+  skill_matches?: string[];    // skills that matched candidate profile
+  skill_gaps?: string[];       // missing skills from candidate profile
+  match_explanation?: string;  // AI explanation of match score
+
   // Compatibility fields for the page.tsx UI
   id?: string;
   title?: string;
@@ -37,7 +52,6 @@ export interface ScrapedJob {
   postedDate?: string;
   remote?: boolean;
   salary?: string;
-  salary_range?: string;
   job_fingerprint?: string;
   is_duplicate?: boolean;
   isDuplicate?: boolean;
@@ -78,7 +92,7 @@ const JOBS_CSV_FILE = path.join(SCRATCH_DIR, 'jobs_data.csv');
 const LOGS_JSON_FILE = path.join(SCRATCH_DIR, 'hourly_reports_log.json');
 const RAW_LOG_FILE = path.join(SCRATCH_DIR, 'raw_scrape_log.json');
 
-let pool: pg.Pool | null = null;
+export let pool: pg.Pool | null = null;
 export let isPgAvailable = false;
 
 if (process.env.PG_CONN_STRING) {
@@ -110,6 +124,27 @@ export async function initDatabase() {
   try {
     const client = await pool.connect();
     try {
+      // Create vector extension
+      await client.query(`CREATE EXTENSION IF NOT EXISTS vector;`).catch(() => {});
+
+      // 1. Create companies table
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS companies (
+          company_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_name VARCHAR(255) UNIQUE NOT NULL,
+          website VARCHAR(255),
+          careers_url VARCHAR(255) NOT NULL,
+          industry VARCHAR(100),
+          country VARCHAR(100) DEFAULT 'India',
+          city VARCHAR(100),
+          employee_count INTEGER,
+          tier VARCHAR(10) CHECK (tier IN ('Tier 1', 'Tier 2', 'Tier 3')) DEFAULT 'Tier 3',
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+          updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 2. Create jobs_discovery table
       await client.query(`
         CREATE TABLE IF NOT EXISTS jobs_discovery (
           job_id VARCHAR(100) PRIMARY KEY,
@@ -139,6 +174,147 @@ export async function initDatabase() {
         );
       `);
 
+      // ── AI enrichment and company relation columns (safe migration) ───
+      const aiColumns: [string, string][] = [
+        ['ai_confidence',   'NUMERIC(4,2)'],
+        ['ai_model_used',   'VARCHAR(150)'],
+        ['ai_extracted',    'BOOLEAN DEFAULT FALSE'],
+        ['review_needed',   'BOOLEAN DEFAULT FALSE'],
+        ['match_score',     'INTEGER'],
+        ['freshness_score', 'INTEGER'],
+        ['composite_score', 'INTEGER'],
+        ['tags',            'TEXT[]'],
+        ['salary_range',    'VARCHAR(255)'],
+        ['language',        'VARCHAR(10) DEFAULT \'en\''],
+        ['deadline',        'VARCHAR(100)'],
+        ['skill_matches',   'TEXT[]'],
+        ['skill_gaps',      'TEXT[]'],
+        ['match_explanation', 'TEXT'],
+        ['company_id',      'UUID REFERENCES companies(company_id) ON DELETE SET NULL']
+      ];
+      for (const [col, def] of aiColumns) {
+        await client.query(
+          `ALTER TABLE jobs_discovery ADD COLUMN IF NOT EXISTS ${col} ${def}`
+        ).catch(() => {}); // silently skip if column already exists
+      }
+
+      // 3. Create company sources
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS company_sources (
+          source_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id UUID REFERENCES companies(company_id) ON DELETE CASCADE,
+          source_type VARCHAR(50) CHECK (source_type IN ('company_career', 'ats', 'job_board', 'other')),
+          source_url VARCHAR(500) NOT NULL,
+          last_crawled_at TIMESTAMP WITH TIME ZONE,
+          is_active BOOLEAN DEFAULT TRUE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 4. Create ATS profiles
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS ats_profiles (
+          ats_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          company_id UUID REFERENCES companies(company_id) ON DELETE CASCADE,
+          ats_type VARCHAR(50) CHECK (ats_type IN ('Greenhouse', 'Lever', 'Workday', 'Ashby', 'SmartRecruiters', 'Recruitee', 'BambooHR', 'Darwinbox', 'ZohoRecruit', 'SAPSuccessFactors', 'OracleTaleo', 'iCIMS', 'Comeet', 'Jobvite', 'Unknown')),
+          fingerprint_hash VARCHAR(64) UNIQUE,
+          custom_selector_rules JSONB,
+          detected_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 5. Create job versions
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS job_versions (
+          version_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          job_id VARCHAR(100) REFERENCES jobs_discovery(job_id) ON DELETE CASCADE,
+          payload JSONB NOT NULL,
+          changed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 6. Create job skills
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS job_skills (
+          job_id VARCHAR(100) REFERENCES jobs_discovery(job_id) ON DELETE CASCADE,
+          skill_name VARCHAR(100) NOT NULL,
+          PRIMARY KEY (job_id, skill_name)
+        );
+      `);
+
+      // 7. Create job scores
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS job_scores (
+          job_id VARCHAR(100) PRIMARY KEY REFERENCES jobs_discovery(job_id) ON DELETE CASCADE,
+          freshness_score DOUBLE PRECISION NOT NULL,
+          trust_score DOUBLE PRECISION NOT NULL,
+          company_quality_score DOUBLE PRECISION NOT NULL,
+          candidate_match_score DOUBLE PRECISION NOT NULL,
+          composite_score DOUBLE PRECISION NOT NULL,
+          explanation TEXT
+        );
+      `);
+
+      // 8. Create job embeddings
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS job_embeddings (
+          job_id VARCHAR(100) PRIMARY KEY REFERENCES jobs_discovery(job_id) ON DELETE CASCADE,
+          embedding vector(1536) NOT NULL
+        );
+      `);
+
+      // 9. Create crawl queue
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS crawl_queue (
+          queue_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          url VARCHAR(500) UNIQUE NOT NULL,
+          priority INTEGER DEFAULT 1,
+          status VARCHAR(20) CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED')) DEFAULT 'PENDING',
+          retry_count INTEGER DEFAULT 0,
+          next_retry_at TIMESTAMP WITH TIME ZONE,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 10. Create crawl logs
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS crawl_logs (
+          log_id SERIAL PRIMARY KEY,
+          url VARCHAR(500) NOT NULL,
+          worker_id VARCHAR(100),
+          jobs_discovered INTEGER DEFAULT 0,
+          status VARCHAR(50),
+          error_message TEXT,
+          duration_ms INTEGER,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 11. Create AI logs
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS ai_logs (
+          log_id SERIAL PRIMARY KEY,
+          job_id VARCHAR(100),
+          model_id VARCHAR(100),
+          tokens_input INTEGER DEFAULT 0,
+          tokens_output INTEGER DEFAULT 0,
+          cost_usd NUMERIC(10, 6) DEFAULT 0.0,
+          latency_ms INTEGER,
+          confidence DOUBLE PRECISION,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 12. Create analytics snapshots
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS analytics_snapshots (
+          snapshot_id SERIAL PRIMARY KEY,
+          metrics JSONB NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+
+      // 13. Create hourly reports
       await client.query(`
         CREATE TABLE IF NOT EXISTS hourly_reports (
           scan_time VARCHAR(100) PRIMARY KEY,
@@ -150,6 +326,12 @@ export async function initDatabase() {
           created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
       `);
+
+      // Create scale indexes
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_jobs_status_last_seen ON jobs_discovery(status, last_seen_timestamp DESC);`).catch(() => {});
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_jobs_embedding ON job_embeddings USING hnsw (embedding vector_cosine_ops);`).catch(() => {});
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_crawl_queue_priority_status ON crawl_queue(priority, status);`).catch(() => {});
+      await client.query(`CREATE INDEX IF NOT EXISTS idx_company_name ON companies(company_name);`).catch(() => {});
 
       // Run database deduplication query to clean up any duplicates created by the old unstable fingerprint hashing bug
       const deleteRes = await client.query(`
@@ -246,6 +428,43 @@ export async function dbUpsertJob(job: ScrapedJob) {
     ]);
   } catch (err: any) {
     console.error(`❌ Failed to upsert job "${job.job_title}" in DB:`, err.message);
+  }
+}
+
+/**
+ * Upserts a job with AI enrichment fields into PostgreSQL.
+ * Extends the base upsert with all optional AI columns.
+ */
+export async function dbUpsertAiJob(job: ScrapedJob) {
+  if (!isPgAvailable || !pool) return;
+  try {
+    // First do base upsert
+    await dbUpsertJob(job);
+    // Then patch the AI-specific fields
+    const aiFields: Record<string, unknown> = {
+      ai_confidence:    job.ai_confidence ?? null,
+      ai_model_used:    job.ai_model_used ?? null,
+      ai_extracted:     job.ai_extracted ?? false,
+      review_needed:    job.review_needed ?? false,
+      match_score:      job.match_score ?? null,
+      freshness_score:  job.freshness_score ?? null,
+      composite_score:  job.composite_score ?? null,
+      tags:             job.tags ?? null,
+      salary_range:     job.salary_range ?? null,
+      language:         job.language ?? 'en',
+      skill_matches:    job.skill_matches ?? null,
+      skill_gaps:       job.skill_gaps ?? null,
+      match_explanation: job.match_explanation ?? null,
+    };
+    const cols = Object.keys(aiFields);
+    const vals = Object.values(aiFields);
+    const sets = cols.map((c, i) => `${c} = $${i + 2}`).join(', ');
+    await pool.query(
+      `UPDATE jobs_discovery SET ${sets} WHERE job_id = $1`,
+      [job.job_id, ...vals]
+    );
+  } catch (err: any) {
+    console.error(`❌ Failed to AI-upsert job "${job.job_title}":`, err.message);
   }
 }
 
@@ -450,6 +669,21 @@ export async function dbLoadJobs(): Promise<ScrapedJob[]> {
       description: row.description,
       apply_url: row.apply_url,
 
+      // AI fields
+      ai_confidence:    row.ai_confidence ?? undefined,
+      ai_model_used:    row.ai_model_used ?? undefined,
+      ai_extracted:     row.ai_extracted ?? false,
+      review_needed:    row.review_needed ?? false,
+      match_score:      row.match_score ?? undefined,
+      freshness_score:  row.freshness_score ?? undefined,
+      composite_score:  row.composite_score ?? undefined,
+      tags:             row.tags ?? [],
+      salary_range:     row.salary_range ?? '',
+      language:         row.language ?? 'en',
+      skill_matches:    row.skill_matches ?? [],
+      skill_gaps:       row.skill_gaps ?? [],
+      match_explanation: row.match_explanation ?? '',
+
       // Compatibility mapping
       id: row.job_id,
       title: row.job_title,
@@ -458,8 +692,7 @@ export async function dbLoadJobs(): Promise<ScrapedJob[]> {
       scrapedAt: row.last_seen_timestamp,
       postedDate: row.posted_date,
       remote: row.work_mode === 'remote',
-      salary: '',
-      salary_range: ''
+      salary: row.salary_range ?? '',
     }));
   } catch (err: any) {
     console.error('❌ Failed to load jobs from PostgreSQL:', err.message);

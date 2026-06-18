@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: discovery-worker-deployment
+  labels:
+    app: jobradar-worker
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: jobradar-worker
+  template:
+    metadata:
+      labels:
+        app: jobradar-worker
+    spec:
+      containers:
+      - name: worker
+        image: jobradar-worker:latest
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: db-secret
+              key: connection-string
+        - name: REDIS_URL
+          value: "redis://redis-cluster-ip:6379"
+        - name: OPENROUTER_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: api-secret
+              key: openrouter-key
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+          requests:
+            cpu: "500m"
+            memory: 1Gi
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-scaler
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: discovery-worker-deployment
+  minReplicas: 5
+  maxReplicas: 100
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 80

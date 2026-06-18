@@ -1,0 +1,12 @@
+FROM mcr.microsoft.com/playwright:v1.42.1-jammy
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+# Start Crawler worker
+CMD ["npx", "tsx", "src/lib/workers/worker-orchestrator.ts"]
