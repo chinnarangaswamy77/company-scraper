@@ -1325,6 +1325,50 @@ export default function CombinedDashboard() {
     toast(`Exported ${targets.length} jobs to JSON`, 'ok');
   };
 
+  const handleDownloadActiveJobsCompaniesJSON = () => {
+    const targets = filteredJobs;
+    if (targets.length === 0) {
+      toast('No active jobs to extract companies from.', 'info');
+      return;
+    }
+
+    const companiesMap = new globalThis.Map<string, { name: string; website?: string; careers?: string }>();
+    targets.forEach(j => {
+      const cleanName = (j.company_name || '').trim();
+      if (!cleanName || cleanName.toLowerCase() === 'live discovered co') return;
+      
+      if (!companiesMap.has(cleanName)) {
+        companiesMap.set(cleanName, {
+          name: cleanName,
+          website: j.company_website || undefined,
+          careers: j.career_page_url || j.job_url || undefined
+        });
+      } else {
+        const existing = companiesMap.get(cleanName)!;
+        if (!existing.website && j.company_website) {
+          existing.website = j.company_website;
+        }
+        if (!existing.careers && (j.career_page_url || j.job_url)) {
+          existing.careers = j.career_page_url || j.job_url;
+        }
+      }
+    });
+
+    const uniqueCompanies = Array.from(companiesMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+
+    if (uniqueCompanies.length === 0) {
+      toast('No valid companies found in active jobs.', 'info');
+      return;
+    }
+
+    const blob = new Blob([JSON.stringify(uniqueCompanies, null, 2)], { type: 'application/json' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute('download', `extracted_companies_${Date.now()}.json`);
+    link.click();
+    toast(`Extracted ${uniqueCompanies.length} unique companies to JSON`, 'ok');
+  };
+
   const handleToggleSelectJob = (id: string) => {
     setSelectedJobs(prev => {
       const next = new Set(prev);
@@ -2811,6 +2855,13 @@ export default function CombinedDashboard() {
                         title="Download filtered jobs as JSON"
                       >
                         <Download className="w-3.5 h-3.5" /> JSON
+                      </button>
+                      <button
+                        onClick={handleDownloadActiveJobsCompaniesJSON}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-indigo-600 rounded-xl text-xs font-bold transition-all"
+                        title="Extract unique companies from active jobs as JSON"
+                      >
+                        <Building className="w-3.5 h-3.5 text-indigo-500" /> Extract Companies
                       </button>
                     </div>
                   </div>
