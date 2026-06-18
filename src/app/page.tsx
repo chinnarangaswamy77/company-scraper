@@ -1300,6 +1300,48 @@ export default function CombinedDashboard() {
     toast(`Exported ${targets.length} jobs to JSON`, 'ok');
   };
 
+  const handleDownloadActiveJobsCSV = () => {
+    const targets = filteredJobs;
+    if (targets.length === 0) {
+      toast('No active jobs to export.', 'info');
+      return;
+    }
+    const headers = ['Job Title', 'Company Name', 'Location', 'Work Mode', 'ATS Source', 'Apply URL', 'Posted Date'];
+    const escapeCsv = (str: string) => `"${(str || '').replace(/"/g, '""')}"`;
+    const lines = [headers.join(',')];
+    targets.forEach(j => {
+      lines.push([
+        escapeCsv(j.job_title),
+        escapeCsv(j.company_name),
+        escapeCsv(j.location),
+        escapeCsv(j.work_mode || ''),
+        escapeCsv(j.source_name || ''),
+        escapeCsv(j.apply_url || j.job_url),
+        escapeCsv(j.posted_date || '')
+      ].join(','));
+    });
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute('download', `active_jobs_${Date.now()}.csv`);
+    link.click();
+    toast(`Exported ${targets.length} jobs to CSV`, 'ok');
+  };
+
+  const handleDownloadActiveJobsJSON = () => {
+    const targets = filteredJobs;
+    if (targets.length === 0) {
+      toast('No active jobs to export.', 'info');
+      return;
+    }
+    const blob = new Blob([JSON.stringify(targets, null, 2)], { type: 'application/json' });
+    const link = document.createElement('a');
+    link.href = URL.createObjectURL(blob);
+    link.setAttribute('download', `active_jobs_${Date.now()}.json`);
+    link.click();
+    toast(`Exported ${targets.length} jobs to JSON`, 'ok');
+  };
+
   const handleToggleSelectJob = (id: string) => {
     setSelectedJobs(prev => {
       const next = new Set(prev);
@@ -2772,6 +2814,21 @@ export default function CombinedDashboard() {
                         <option value="12-25 LPA">12-25 LPA</option>
                         <option value="25+ LPA">25+ LPA</option>
                       </select>
+
+                      <button
+                        onClick={handleDownloadActiveJobsCSV}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-650 rounded-xl text-xs font-bold transition-all"
+                        title="Download filtered jobs as CSV"
+                      >
+                        <Download className="w-3.5 h-3.5" /> CSV
+                      </button>
+                      <button
+                        onClick={handleDownloadActiveJobsJSON}
+                        className="flex items-center gap-1 px-3 py-1.5 bg-white border border-slate-200 hover:bg-slate-50 text-slate-655 rounded-xl text-xs font-bold transition-all"
+                        title="Download filtered jobs as JSON"
+                      >
+                        <Download className="w-3.5 h-3.5" /> JSON
+                      </button>
                     </div>
                   </div>
 
