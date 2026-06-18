@@ -1,13 +1,25 @@
 import { NextRequest, NextResponse } from 'next/server';
-import pg from 'pg';
+import { Pool } from 'pg';
 
-export async function GET(req: NextRequest) {
+interface DuplicateRow {
+  norm_company: string;
+  norm_title: string;
+  norm_location: string;
+  cnt: string;
+  ids: string[];
+  original_companies: string[];
+  original_titles: string[];
+  locations: string[];
+  urls: string[];
+}
+
+export async function GET(_req: NextRequest) {
   try {
     if (!process.env.PG_CONN_STRING) {
       return NextResponse.json({ error: 'PostgreSQL connection string not set.' });
     }
 
-    const pool = new pg.Pool({
+    const pool = new Pool({
       connectionString: process.env.PG_CONN_STRING,
       ssl: { rejectUnauthorized: false }
     });
@@ -40,7 +52,7 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({
         totalJobs: totalCount,
         duplicatesCount: dupRes.rowCount,
-        duplicates: dupRes.rows.map(row => ({
+        duplicates: dupRes.rows.map((row: any) => ({
           normalizedCompany: row.norm_company,
           normalizedTitle: row.norm_title,
           count: parseInt(row.cnt),
@@ -55,7 +67,8 @@ export async function GET(req: NextRequest) {
       client.release();
       await pool.end();
     }
-  } catch (error: any) {
-    return NextResponse.json({ error: error.message }, { status: 500 });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }

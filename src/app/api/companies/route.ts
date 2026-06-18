@@ -17,16 +17,20 @@ export async function GET() {
   }
 }
 
-function extractCompanyFromObject(item: any): { name: string; website?: string; careers?: string } | null {
+function extractCompanyFromObject(item: unknown): { name: string; website?: string; careers?: string } | null {
   if (!item || typeof item !== 'object') return null;
-  const name = item.name || item.company || item.companyName || item.company_name || '';
+
+  // Cast to Record<string, unknown> to access properties by string keys
+  const typedItem = item as Record<string, unknown>;
+
+  const name = typedItem.name || typedItem.company || typedItem.companyName || typedItem.company_name || '';
   if (typeof name !== 'string' || !name.trim()) return null;
 
-  let website = item.website || item.website_url || item.url || item.homepage || item.domain || '';
-  if (typeof website !== 'string') website = '';
+  const rawWebsite = typedItem.website || typedItem.website_url || typedItem.url || typedItem.homepage || typedItem.domain || '';
+  let website = typeof rawWebsite === 'string' ? rawWebsite : '';
 
-  let careers = item.careers || item.careers_url || item.career || item.career_url || item.jobs || item.jobs_url || '';
-  if (typeof careers !== 'string') careers = '';
+  const rawCareers = typedItem.careers || typedItem.careers_url || typedItem.career || typedItem.career_url || typedItem.jobs || typedItem.jobs_url || '';
+  let careers = typeof rawCareers === 'string' ? rawCareers : '';
 
   // In user's JSON, website_url might contain the careers link (e.g. https://juspay.io/careers)
   // If only one URL is provided and it has career/job keywords, map it to careers instead of website
@@ -67,7 +71,7 @@ export async function POST(req: NextRequest) {
         const parsed = JSON.parse(trimmedText);
         if (Array.isArray(parsed)) {
           parsedCompanies = parsed
-            .map((item: any) => {
+            .map((item: unknown) => {
               if (typeof item === 'string') {
                 return { name: item.trim() };
               } else {
@@ -79,7 +83,7 @@ export async function POST(req: NextRequest) {
           const list = parsed.companies || parsed.list || parsed.data || [];
           if (Array.isArray(list)) {
             parsedCompanies = list
-              .map((item: any) => {
+              .map((item: unknown) => {
                 if (typeof item === 'string') {
                   return { name: item.trim() };
                 } else {
@@ -94,9 +98,9 @@ export async function POST(req: NextRequest) {
             }
           }
         }
-      } catch (jsonErr: any) {
+      } catch (jsonErr: unknown) {
         // Fallback to regex extraction if JSON parsing fails but it is JSON-like text
-        console.warn('Uploaded text was JSON-like but parsing failed, attempting regex block extraction:', jsonErr.message);
+        console.warn('Uploaded text was JSON-like but parsing failed, attempting regex block extraction:', (jsonErr as Error).message);
         
         // Match block-by-block contents between curly braces to capture company details
         const objectBlockRegex = /\{([^{}]+)\}/g;
