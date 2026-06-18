@@ -567,13 +567,100 @@ type JobItem = { url: string; title: string; description: string; location: stri
 
 function isIndiaLocation(loc: string): boolean {
   if (!loc) return true; // include if unknown
-  const l = loc.toLowerCase();
-  return l.includes('india') || l.includes('bengaluru') || l.includes('bangalore') ||
-    l.includes('hyderabad') || l.includes('pune') || l.includes('mumbai') ||
-    l.includes('chennai') || l.includes('noida') || l.includes('gurugram') ||
-    l.includes('gurgaon') || l.includes('kochi') || l.includes('delhi') ||
-    l.includes('kolkata') || l.includes('remote') || l.includes('wfh') ||
-    l.includes('hybrid') || l === '';
+  const l = loc.toLowerCase().trim();
+  if (l === '') return true;
+
+  // List of clear foreign country/city indicators to exclude
+  const foreignIndicators = [
+    'united states', 'usa', 'united kingdom', 'uk', 'london', 'great britain',
+    'canada', 'toronto', 'vancouver', 'germany', 'berlin', 'munich',
+    'france', 'paris', 'australia', 'sydney', 'melbourne', 'singapore',
+    'japan', 'tokyo', 'china', 'beijing', 'shanghai', 'hong kong',
+    'netherlands', 'amsterdam', 'switzerland', 'zurich', 'geneva',
+    'poland', 'warsaw', 'ukraine', 'kyiv', 'brazil', 'sao paulo',
+    'mexico', 'spain', 'madrid', 'barcelona', 'italy', 'rome', 'milan',
+    'ireland', 'dublin', 'sweden', 'stockholm', 'norway', 'oslo',
+    'denmark', 'copenhagen', 'finland', 'helsinki', 'belgium', 'brussels',
+    'austria', 'vienna', 'uae', 'dubai', 'abu dhabi', 'saudi arabia', 'riyadh',
+    'new zealand', 'auckland', 'south africa', 'johannesburg', 'cape town',
+    'vietnam', 'hanoi', 'ho chi minh', 'philippines', 'manila',
+    'indonesia', 'jakarta', 'malaysia', 'kuala lumpur', 'thailand', 'bangkok',
+    'san francisco', 'new york', 'seattle', 'boston', 'austin', 'chicago',
+    'los angeles', 'california', 'texas', 'washington', 'massachusetts',
+    'illinois', 'colorado', 'denver', 'portland', 'oregon'
+  ];
+
+  for (const indicator of foreignIndicators) {
+    const regex = new RegExp(`\\b${indicator}\\b`, 'i');
+    if (regex.test(l)) {
+      return false;
+    }
+  }
+
+  // Check if it has Indian indicators
+  const indianIndicators = [
+    'india', 'bengaluru', 'bangalore', 'hyderabad', 'pune', 'mumbai',
+    'chennai', 'noida', 'gurugram', 'gurgaon', 'kochi', 'cochin', 'delhi',
+    'kolkata', 'trivandrum', 'thiruvananthapuram', 'karnataka', 'telangana',
+    'maharashtra', 'tamil nadu', 'uttar pradesh', 'haryana', 'kerala',
+    'west bengal', 'ahmedabad', 'gujarat', 'jaipur', 'rajasthan', 'indore',
+    'madhya pradesh', 'chandigarh', 'bhubaneswar', 'odisha', 'coimbatore'
+  ];
+
+  for (const ind of indianIndicators) {
+    if (l.includes(ind)) return true;
+  }
+
+  // Check if remote or hybrid (without other foreign exclusions)
+  if (l.includes('remote') || l.includes('wfh') || l.includes('hybrid') || l.includes('anywhere')) {
+    const globalExclusions = [
+      'us only', 'usa only', 'americas', 'europe', 'emea', 'latam',
+      'north america', 'canada only', 'uk only', 'germany only'
+    ];
+    for (const excl of globalExclusions) {
+      if (l.includes(excl)) return false;
+    }
+    return true; // standard remote
+  }
+
+  return false;
+}
+
+function isIndiaSearchResult(title: string, snippet: string, url: string): boolean {
+  const t = title.toLowerCase();
+  const s = snippet.toLowerCase();
+  const u = url.toLowerCase();
+
+  // If the url contains a foreign country code subpath, reject it.
+  if (/\/(us|uk|ca|sg|ae|au|gb|nz|de|fr|hk)\//.test(u)) {
+    if (!u.includes('/in/') && !u.includes('/india/') && !t.includes('india')) {
+      return false;
+    }
+  }
+
+  // Check for foreign cities/countries in the title or search url domain suffix
+  const foreignTitleIndicators = [
+    'united states', 'usa', 'united kingdom', 'london',
+    'canada', 'toronto', 'vancouver', 'germany', 'berlin', 'munich',
+    'australia', 'sydney', 'melbourne', 'singapore', 'tokyo', 'japan',
+    'san francisco', 'new york', 'seattle', 'boston', 'austin', 'dubai'
+  ];
+  for (const indicator of foreignTitleIndicators) {
+    if (t.includes(indicator) || u.includes(indicator.replace(/\s+/g, ''))) {
+      return false;
+    }
+  }
+
+  // It must mention at least one Indian city, state, or the word "India"
+  const indianKeywords = [
+    'india', 'bengaluru', 'bangalore', 'hyderabad', 'pune', 'mumbai',
+    'chennai', 'noida', 'gurugram', 'gurgaon', 'kochi', 'cochin', 'delhi',
+    'kolkata', 'trivandrum', 'karnataka', 'telangana', 'maharashtra',
+    'tamil nadu', 'uttar pradesh', 'haryana', 'kerala', 'west bengal'
+  ];
+
+  const combined = `${t} ${s} ${u}`;
+  return indianKeywords.some(keyword => combined.includes(keyword));
 }
 
 /** Greenhouse public JSON API */
@@ -1598,6 +1685,17 @@ export async function runJobScraper() {
         if (!j.url || !j.title) continue;
         const urlKey = j.url.split('?')[0].toLowerCase();
         if (seenUrls.has(urlKey)) continue;
+
+        // Strict India checks
+        const loc = j.location || '';
+        if (!isIndiaLocation(loc)) continue;
+        
+        if (loc === '' || loc.toLowerCase() === 'remote' || loc.toLowerCase() === 'anywhere') {
+          if (!isIndiaSearchResult(j.title, j.description || '', j.url)) {
+            continue;
+          }
+        }
+
         seenUrls.add(urlKey);
         const srcName = j.sourceName || defaultSource;
         const isJobBoard = ['LinkedIn', 'Naukri', 'Indeed', 'Glassdoor', 'Wellfound',
@@ -1817,6 +1915,11 @@ export async function runJobScraper() {
           if (seenUrls.has(urlStr.toLowerCase())) return;
 
           if (!isValidJobPage(res.url, res.title)) {
+            return;
+          }
+
+          // Strict India check for search engine result listings
+          if (!isIndiaSearchResult(res.title, res.description, res.url)) {
             return;
           }
 
