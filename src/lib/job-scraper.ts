@@ -446,6 +446,119 @@ async function queryYahooJobs(query: string): Promise<{ url: string; title: stri
   return extractUrlsFromSearchHtml(html);
 }
 
+async function queryBingJobs(query: string): Promise<{ url: string; title: string; description: string }[]> {
+  const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': ua,
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://www.bing.com/'
+    },
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!response.ok) throw new Error(`Bing status ${response.status}`);
+  const html = await response.text();
+  return extractUrlsFromBingHtml(html);
+}
+
+function extractUrlsFromBingHtml(html: string): { url: string; title: string; description: string }[] {
+  const results: { url: string; title: string; description: string }[] = [];
+  const regex = /<h2[^>]*>\s*<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    let url = match[1];
+    const title = match[2];
+
+    // Decode Bing redirect URL if present
+    if (url.includes('/ck/a?!') && url.includes('&u=')) {
+      const uMatch = /[&?]u=([^&"'>]+)/.exec(url);
+      if (uMatch) {
+        try {
+          let encoded = uMatch[1];
+          if (encoded.startsWith('a1')) {
+            encoded = encoded.substring(2);
+          }
+          const base64 = encoded.replace(/-/g, '+').replace(/_/g, '/');
+          const decoded = Buffer.from(base64, 'base64').toString('utf-8');
+          if (decoded.startsWith('http')) {
+            url = decoded;
+          }
+        } catch (e) {
+          // Fallback to original url
+        }
+      }
+    }
+
+    let description = '';
+    const index = html.indexOf(match[0]);
+    if (index !== -1) {
+      const remaining = html.substring(index, index + 2000);
+      const snippetMatch = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(remaining);
+      if (snippetMatch) {
+        description = cleanHtmlText(snippetMatch[1]);
+      }
+    }
+
+    const cleanUrl = url.replace(/&amp;/g, '&');
+
+    if (cleanUrl.startsWith('http') && !cleanUrl.includes('bing.com')) {
+      results.push({
+        url: cleanUrl,
+        title: cleanHtmlText(title),
+        description
+      });
+    }
+  }
+  return results;
+}
+
+async function queryBraveJobs(query: string): Promise<{ url: string; title: string; description: string }[]> {
+  const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+  const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
+
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'User-Agent': ua,
+      'Accept': 'text/html,application/xhtml+xml',
+      'Accept-Language': 'en-US,en;q=0.9',
+      'Referer': 'https://search.brave.com/'
+    },
+    signal: AbortSignal.timeout(12000)
+  });
+
+  if (!response.ok) throw new Error(`Brave Search status ${response.status}`);
+  const html = await response.text();
+  return extractUrlsFromBraveHtml(html);
+}
+
+function extractUrlsFromBraveHtml(html: string): { url: string; title: string; description: string }[] {
+  const results: { url: string; title: string; description: string }[] = [];
+  const regex = /class="snippet[^"]*"[^>]*>[\s\S]*?<a href="([^"]+)"[^>]*>[\s\S]*?class="title[^"]*"[^>]*>([\s\S]*?)<\/div>[\s\S]*?class="content[^"]*"[^>]*>([\s\S]*?)<\/div>/g;
+  let match;
+  while ((match = regex.exec(html)) !== null) {
+    const url = match[1];
+    const title = match[2];
+    const description = match[3];
+
+    const cleanUrl = url.replace(/&amp;/g, '&');
+
+    if (cleanUrl.startsWith('http') && !cleanUrl.includes('brave.com')) {
+      results.push({
+        url: cleanUrl,
+        title: cleanHtmlText(title),
+        description: cleanHtmlText(description)
+      });
+    }
+  }
+  return results;
+}
+
 // ─────────────────────────────────────────────────────────────
 //  DIRECT ATS & JOB-BOARD API FETCHERS
 // ─────────────────────────────────────────────────────────────
@@ -1671,12 +1784,29 @@ export async function runJobScraper() {
 
         let searchResults: { url: string; title: string; description: string }[] = [];
         try {
-          searchResults = await Promise.any([
+          const settled = await Promise.allSettled([
             queryDDGJobs(q),
-            queryYahooJobs(q)
+            queryYahooJobs(q),
+            queryBingJobs(q),
+            queryBraveJobs(q)
           ]);
+          
+          settled.forEach((r, idx) => {
+            const engineNames = ['DuckDuckGo', 'Yahoo', 'Bing', 'Brave'];
+            if (r.status === 'fulfilled') {
+              if (r.value.length > 0) {
+                searchResults.push(...r.value);
+              }
+            } else {
+              console.warn(`Search engine ${engineNames[idx]} failed:`, r.reason?.message || r.reason);
+            }
+          });
+          
+          if (searchResults.length === 0) {
+            throw new Error('No results from any search engine');
+          }
         } catch {
-          logJobMessage(jobsState, `  ⏭️ Search [${i + 1}] timed out — skipping (ATS data still captured).`);
+          logJobMessage(jobsState, `  ⏭️ Search [${i + 1}] returned no results — skipping.`);
           saveJobState(jobsState);
           await new Promise(r => setTimeout(r, 300));
           continue;
