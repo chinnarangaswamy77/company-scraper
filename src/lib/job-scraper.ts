@@ -422,11 +422,44 @@ function extractUrlsFromSearchHtml(html: string): { url: string; title: string; 
   return results;
 }
 
+async function fetchSearchWithRetry(url: string, init: RequestInit, maxAttempts = 2): Promise<Response> {
+  let attempts = 0;
+  let delay = 1500;
+  while (attempts < maxAttempts) {
+    attempts++;
+    try {
+      // Rotate user agent on retry if headers exist
+      if (attempts > 1 && init.headers) {
+        const headers = init.headers as Record<string, string>;
+        headers['User-Agent'] = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+      }
+      const response = await fetch(url, init);
+      // Retry on rate limit (429) or temporary server errors (5xx)
+      if (response.status === 429 || (response.status >= 500 && response.status <= 599)) {
+        if (attempts === maxAttempts) {
+          return response;
+        }
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+        continue;
+      }
+      return response;
+    } catch (e) {
+      if (attempts === maxAttempts) {
+        throw e;
+      }
+      await new Promise(resolve => setTimeout(resolve, delay));
+      delay *= 2;
+    }
+  }
+  throw new Error('Search request failed after maximum retry attempts');
+}
+
 async function queryDDGJobs(query: string): Promise<{ url: string; title: string; description: string }[]> {
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const url = `https://html.duckduckgo.com/html/`;
 
-  const response = await fetch(url, {
+  const response = await fetchSearchWithRetry(url, {
     method: 'POST',
     headers: {
       'User-Agent': ua,
@@ -448,7 +481,7 @@ async function queryYahooJobs(query: string): Promise<{ url: string; title: stri
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const url = `https://search.yahoo.com/search?p=${encodeURIComponent(query)}&n=10`;
 
-  const response = await fetch(url, {
+  const response = await fetchSearchWithRetry(url, {
     method: 'GET',
     headers: {
       'User-Agent': ua,
@@ -468,7 +501,7 @@ async function queryBingJobs(query: string): Promise<{ url: string; title: strin
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const url = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
 
-  const response = await fetch(url, {
+  const response = await fetchSearchWithRetry(url, {
     method: 'GET',
     headers: {
       'User-Agent': ua,
@@ -539,7 +572,7 @@ async function queryBraveJobs(query: string): Promise<{ url: string; title: stri
   const ua = USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
   const url = `https://search.brave.com/search?q=${encodeURIComponent(query)}`;
 
-  const response = await fetch(url, {
+  const response = await fetchSearchWithRetry(url, {
     method: 'GET',
     headers: {
       'User-Agent': ua,

@@ -127,6 +127,10 @@ export function sanitiseHtmlForAi(html: string, maxChars = 8000): string {
  * Makes a completion call to OpenRouter.
  * Returns a typed AiResponse — never throws; errors are captured in .error.
  */
+/**
+ * Makes a completion call to OpenRouter.
+ * Returns a typed AiResponse — never throws; errors are captured in .error.
+ */
 export async function callOpenRouter(opts: AiRequestOptions): Promise<AiResponse> {
   const apiKey = process.env.OPENROUTER_API_KEY;
 
@@ -144,45 +148,157 @@ export async function callOpenRouter(opts: AiRequestOptions): Promise<AiResponse
   }
 
   const t0 = Date.now();
+  let attempts = 0;
+  const maxAttempts = 3;
+  let delay = 2000; // Start with 2 seconds backoff
 
-  try {
-    const messages: { role: string; content: string }[] = [
-      { role: 'system', content: opts.systemPrompt },
-      { role: 'user', content: opts.userContent }
-    ];
+  while (true) {
+    attempts++;
+    try {
+      const messages: { role: string; content: string }[] = [
+        { role: 'system', content: opts.systemPrompt },
+        { role: 'user', content: opts.userContent }
+      ];
 
-    const body: Record<string, unknown> = {
-      model: opts.model,
-      messages,
-      max_tokens: opts.maxTokens ?? 1024,
-      temperature: opts.temperature ?? 0.1,
-    };
+      const body: Record<string, unknown> = {
+        model: opts.model,
+        messages,
+        max_tokens: opts.maxTokens ?? 1024,
+        temperature: opts.temperature ?? 0.1,
+      };
 
-    // Enable JSON mode for models that support it
-    if (opts.jsonMode) {
-      body.response_format = { type: 'json_object' };
-    }
+      // Enable JSON mode for models that support it
+      if (opts.jsonMode) {
+        body.response_format = { type: 'json_object' };
+      }
 
-    const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': 'https://jobradar.india',
-        'X-Title': 'JobRadar India'
-      },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(30_000)
-    });
+      const res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://jobradar.india',
+          'X-Title': 'JobRadar India'
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30_000)
+      });
 
-    const latencyMs = Date.now() - t0;
+      const latencyMs = Date.now() - t0;
 
-    if (!res.ok) {
-      const errText = await res.text().catch(() => res.statusText);
-      console.error(`[OpenRouter] ${opts.model} HTTP ${res.status}: ${errText}`);
+      if (!res.ok) {
+        const errText = await res.text().catch(() => res.statusText);
+        console.error(`[OpenRouter] ${opts.model} HTTP ${res.status}: ${errText} (attempt ${attempts}/${maxAttempts})`);
+
+        const isRateLimited = 
+          res.status === 429 || 
+          errText.toLowerCase().includes('rate limit') || 
+          errText.toLowerCase().includes('quota') || 
+          errText.toLowerCase().includes('rate-limited') || 
+          errText.toLowerCase().includes('429');
+
+        if (isRateLimited && attempts < maxAttempts) {
+          // Parse retry after header or error message body if present
+          let waitTime = delay;
+          const retryAfterHeader = res.headers.get('retry-after');
+          if (retryAfterHeader) {
+            const parsed = parseInt(retryAfterHeader, 10);
+            if (!isNaN(parsed)) waitTime = parsed * 1000;
+          } else {
+            const retryAfterMatch = errText.match(/"retry_after_seconds"\s*:\s*([0-9.]+)/i);
+            if (retryAfterMatch && retryAfterMatch[1]) {
+              waitTime = parseFloat(retryAfterMatch[1]) * 1000;
+            }
+          }
+          console.warn(`[OpenRouter] Rate limited (HTTP ${res.status}). Retrying in ${waitTime}ms...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          delay *= 2;
+          continue;
+        }
+
+        updateModelStatus(opts.model, isRateLimited ? 'rate_limited' : 'error', `HTTP ${res.status}: ${errText}`);
+
+        return {
+          content: '',
+          model: opts.model,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          latencyMs,
+          estimatedCostUsd: 0,
+          success: false,
+          error: `HTTP ${res.status}: ${errText}`
+        };
+      }
+
+      const data = await res.json();
       
-      const isRateLimited = res.status === 429 || errText.toLowerCase().includes('rate limit') || errText.toLowerCase().includes('quota');
-      updateModelStatus(opts.model, isRateLimited ? 'rate_limited' : 'error', `HTTP ${res.status}: ${errText}`);
+      // Some providers via OpenRouter may return 200 OK but embed a provider-level error inside choices or error field
+      if (data.error) {
+        const errMsg = typeof data.error === 'string' ? data.error : JSON.stringify(data.error);
+        console.error(`[OpenRouter] ${opts.model} returned error payload: ${errMsg} (attempt ${attempts}/${maxAttempts})`);
+        
+        const isRateLimited = 
+          errMsg.toLowerCase().includes('rate limit') || 
+          errMsg.toLowerCase().includes('quota') || 
+          errMsg.toLowerCase().includes('rate-limited') || 
+          errMsg.toLowerCase().includes('429');
+
+        if (isRateLimited && attempts < maxAttempts) {
+          let waitTime = delay;
+          const retryAfterMatch = errMsg.match(/retry_after_seconds"\s*:\s*([0-9.]+)/i) || errMsg.match(/retry after\s*([0-9.]+)\s*s/i);
+          if (retryAfterMatch && retryAfterMatch[1]) {
+            waitTime = parseFloat(retryAfterMatch[1]) * 1000;
+          }
+          console.warn(`[OpenRouter] Rate limited by provider. Retrying in ${waitTime}ms...`);
+          await new Promise(resolve => setTimeout(resolve, waitTime));
+          delay *= 2;
+          continue;
+        }
+
+        updateModelStatus(opts.model, isRateLimited ? 'rate_limited' : 'error', `Payload Error: ${errMsg}`);
+        return {
+          content: '',
+          model: opts.model,
+          usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
+          latencyMs,
+          estimatedCostUsd: 0,
+          success: false,
+          error: `Payload Error: ${errMsg}`
+        };
+      }
+
+      const content: string = data.choices?.[0]?.message?.content ?? '';
+      const usage = {
+        promptTokens: data.usage?.prompt_tokens ?? 0,
+        completionTokens: data.usage?.completion_tokens ?? 0,
+        totalTokens: data.usage?.total_tokens ?? 0,
+      };
+
+      const estimatedCostUsd = estimateCost(opts.model, usage.totalTokens);
+
+      console.log(
+        `[OpenRouter] ✅ ${opts.model} | ${latencyMs}ms | ${usage.totalTokens} tokens | ~$${estimatedCostUsd.toFixed(5)}`
+      );
+
+      updateModelStatus(opts.model, 'active');
+
+      return { content, model: opts.model, usage, latencyMs, estimatedCostUsd, success: true };
+    } catch (err: any) {
+      const latencyMs = Date.now() - t0;
+      console.error(`[OpenRouter] ❌ ${opts.model} failed on attempt ${attempts}/${maxAttempts}:`, err.message);
+
+      const isRateLimited = 
+        err.message.toLowerCase().includes('429') || 
+        err.message.toLowerCase().includes('rate limit') ||
+        err.message.toLowerCase().includes('quota');
+
+      if (isRateLimited && attempts < maxAttempts) {
+        console.warn(`[OpenRouter] Rate limited (Exception). Retrying in ${delay}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2;
+        continue;
+      }
+
+      updateModelStatus(opts.model, isRateLimited ? 'rate_limited' : 'error', err.message);
 
       return {
         content: '',
@@ -191,43 +307,9 @@ export async function callOpenRouter(opts: AiRequestOptions): Promise<AiResponse
         latencyMs,
         estimatedCostUsd: 0,
         success: false,
-        error: `HTTP ${res.status}: ${errText}`
+        error: err.message
       };
     }
-
-    const data = await res.json();
-    const content: string = data.choices?.[0]?.message?.content ?? '';
-    const usage = {
-      promptTokens: data.usage?.prompt_tokens ?? 0,
-      completionTokens: data.usage?.completion_tokens ?? 0,
-      totalTokens: data.usage?.total_tokens ?? 0,
-    };
-
-    const estimatedCostUsd = estimateCost(opts.model, usage.totalTokens);
-
-    console.log(
-      `[OpenRouter] ✅ ${opts.model} | ${latencyMs}ms | ${usage.totalTokens} tokens | ~$${estimatedCostUsd.toFixed(5)}`
-    );
-
-    updateModelStatus(opts.model, 'active');
-
-    return { content, model: opts.model, usage, latencyMs, estimatedCostUsd, success: true };
-  } catch (err: any) {
-    const latencyMs = Date.now() - t0;
-    console.error(`[OpenRouter] ❌ ${opts.model} failed:`, err.message);
-    
-    const isRateLimited = err.message.toLowerCase().includes('429') || err.message.toLowerCase().includes('rate limit');
-    updateModelStatus(opts.model, isRateLimited ? 'rate_limited' : 'error', err.message);
-
-    return {
-      content: '',
-      model: opts.model,
-      usage: { promptTokens: 0, completionTokens: 0, totalTokens: 0 },
-      latencyMs,
-      estimatedCostUsd: 0,
-      success: false,
-      error: err.message
-    };
   }
 }
 
